@@ -39,6 +39,8 @@ def is_mounted(mountpoint):
 
 def init_db(path):
     path.unlink(missing_ok=True)
+    path.with_name(path.name + "-wal").unlink(missing_ok=True)
+    path.with_name(path.name + "-shm").unlink(missing_ok=True)
     db = sqlite3.connect(path)
     db.executescript(
         """

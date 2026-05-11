@@ -24,7 +24,7 @@ if is_mounted; then
   exit 0
 fi
 
-rm -f "$DB"
+rm -f "$DB" "$DB-wal" "$DB-shm"
 sqlite3 "$DB" <<'SQL'
 CREATE TABLE contacts (
   _slfs_path TEXT UNIQUE NOT NULL,
