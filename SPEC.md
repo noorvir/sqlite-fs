@@ -12,9 +12,9 @@ Expose only top-level Markdown files:
 /{table}/{file}.md
 ```
 
-Nested paths and non-`.md` files are out of scope and should fail normally, e.g. `ENOENT` or `ENOTDIR`.
+Nested typed paths and non-`.md` typed files are out of scope and should route to passthrough storage.
 
-The root lists eligible tables. A table folder lists rows by `_slfs_path`.
+The root lists eligible tables merged with passthrough root entries. A table folder lists rows by `_slfs_path` merged with passthrough entries.
 
 A table is exposed as a folder when it has:
 
@@ -141,6 +141,35 @@ If needed, serialize filesystem commits through a single writer queue.
 Unsupported POSIX operations return ordinary errors such as `ENOSYS`; the mount must not crash.
 
 Panics and malformed callback input must be converted to ordinary filesystem errors.
+
+## Passthrough storage
+
+The mount is an overlay of typed SQLite rows and a normal backing directory.
+
+Typed route:
+
+```txt
+/{table}/{file}.md
+```
+
+A path is typed only when `{table}` is an eligible table with the required `_slfs_` columns.
+
+All other paths use passthrough storage, including:
+
+```txt
+/.obsidian/**
+/assets/**
+/{table}/nested/**
+/{table}/non-md-file
+```
+
+Passthrough should use host filesystem semantics where possible: directories, binary files, app metadata, rename, delete, and arbitrary nesting.
+
+Directory listings merge both sources. If both sources contain the same visible path, the typed SQLite row wins.
+
+Creates/writes to typed paths must update SQLite, not the passthrough directory.
+
+Creates/writes to non-typed paths must update passthrough storage, not SQLite.
 
 ## Future work
 
