@@ -4,6 +4,7 @@
 import argparse
 import json
 import pathlib
+import shutil
 import shlex
 import sqlite3
 import subprocess
@@ -13,6 +14,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "target" / "debug" / "sqlite-fs"
 DB = pathlib.Path("/tmp/sqlite-fs-poc.db")
+BACKING = pathlib.Path("/tmp/sqlite-fs-poc.files")
 LOG = pathlib.Path("/tmp/sqlite-fs-poc.log")
 
 
@@ -78,20 +80,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mountpoint", default="/Volumes/minfs-poc")
     parser.add_argument("--db", default=str(DB))
+    parser.add_argument("--backing", default=str(BACKING))
     args = parser.parse_args()
 
     mountpoint = pathlib.Path(args.mountpoint)
     db_path = pathlib.Path(args.db)
+    backing = pathlib.Path(args.backing)
     if not mountpoint.exists():
         raise SystemExit(f"Mountpoint does not exist: {mountpoint}")
     if is_mounted(mountpoint):
         raise SystemExit(f"Already mounted: {mountpoint}")
 
     init_db(db_path)
+    shutil.rmtree(backing, ignore_errors=True)
+    backing.mkdir(parents=True)
     run(["cargo", "build", "-p", "sqlite-fs", "--bin", "sqlite-fs"], timeout=180)
     LOG.unlink(missing_ok=True)
 
-    cmd = [str(BIN), "--db", db_path, mountpoint]
+    cmd = [str(BIN), "--db", db_path, "--backing", backing, mountpoint]
     print("$", " ".join(shlex.quote(str(c)) for c in cmd), flush=True)
     with LOG.open("w") as log:
         proc = subprocess.Popen([str(c) for c in cmd], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
@@ -109,6 +115,16 @@ def main():
         root = run(["ls", mountpoint]).stdout.split()
         if root != ["books", "contacts"]:
             raise RuntimeError(f"unexpected root listing: {root!r}")
+
+        run(["mkdir", mountpoint / ".obsidian"])
+        run(["sh", "-c", 'printf "{}\\n" > "$1/.obsidian/app.json"', "sh", mountpoint])
+        if run(["cat", mountpoint / ".obsidian/app.json"]).stdout != "{}\n":
+            raise RuntimeError("passthrough .obsidian file did not round-trip")
+
+        run(["mkdir", mountpoint / "contacts" / "nested"])
+        run(["sh", "-c", 'printf "pass\\n" > "$1/contacts/nested/pass.md"', "sh", mountpoint])
+        if run(["cat", mountpoint / "contacts" / "nested" / "pass.md"]).stdout != "pass\n":
+            raise RuntimeError("nested passthrough file did not round-trip")
 
         run([
             "sh",
@@ -143,11 +159,11 @@ def main():
         if "Updated\n" not in rendered or "noorvir2@example.com" not in rendered:
             raise RuntimeError(f"unexpected rendered document: {rendered!r}")
 
-        result = run(["sh", "-c", 'printf x > "$1/contacts/ignored.txt"', "sh", mountpoint], check=False)
-        if result.returncode == 0:
-            raise RuntimeError("non-Markdown file unexpectedly succeeded")
+        run(["sh", "-c", 'printf x > "$1/contacts/ignored.txt"', "sh", mountpoint])
+        if run(["cat", mountpoint / "contacts" / "ignored.txt"]).stdout != "x":
+            raise RuntimeError("non-Markdown passthrough file did not round-trip")
 
-        print("PASS: generic SQLite-backed Markdown filesystem works through mounted FSKit")
+        print("PASS: generic SQLite-backed Markdown filesystem with passthrough works through mounted FSKit")
     finally:
         if proc.poll() is None:
             proc.terminate()

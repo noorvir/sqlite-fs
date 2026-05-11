@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB="${DB:-/tmp/sqlite-fs-manual.db}"
 MP="${MP:-/Volumes/minfs-poc}"
+BACKING="${BACKING:-/tmp/sqlite-fs-manual.files}"
 LOG="${LOG:-/tmp/sqlite-fs-manual.log}"
 PID="${PID:-/tmp/sqlite-fs-manual.pid}"
 
@@ -25,6 +26,8 @@ if is_mounted; then
 fi
 
 rm -f "$DB" "$DB-wal" "$DB-shm"
+rm -rf "$BACKING"
+mkdir -p "$BACKING"
 sqlite3 "$DB" <<'SQL'
 CREATE TABLE contacts (
   _slfs_path TEXT UNIQUE NOT NULL,
@@ -51,7 +54,7 @@ SQL
 cargo build -p sqlite-fs --bin sqlite-fs
 
 rm -f "$LOG"
-"$ROOT/target/debug/sqlite-fs" --db "$DB" "$MP" >"$LOG" 2>&1 &
+"$ROOT/target/debug/sqlite-fs" --db "$DB" --backing "$BACKING" "$MP" >"$LOG" 2>&1 &
 echo "$!" > "$PID"
 
 for _ in {1..80}; do
@@ -64,6 +67,7 @@ for _ in {1..80}; do
     echo "Mounted sqlite-fs"
     echo "  mountpoint: $MP"
     echo "  database:   $DB"
+    echo "  backing:    $BACKING"
     echo "  log:        $LOG"
     echo "  pid:        $(cat "$PID")"
     echo

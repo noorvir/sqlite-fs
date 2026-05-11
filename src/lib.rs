@@ -1,12 +1,15 @@
 use minfuse::{
-    Attr, DirEntry, FileHandle, FileSystem, FsError, FsResult, NO_HANDLE, OpenOptions, RenameFlags,
-    SetTimes, StatFs,
+    Attr, DirEntry, EntryKind, FileHandle, FileSystem, FsError, FsResult, NO_HANDLE, OpenOptions,
+    RenameFlags, SetTimes, StatFs,
 };
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::fs::{self, File, OpenOptions as StdOpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -14,6 +17,7 @@ use std::time::SystemTime;
 static PLACEHOLDER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct SqliteFs {
+    backing: PathBuf,
     inner: Mutex<Inner>,
 }
 
@@ -23,11 +27,21 @@ struct Inner {
     next_handle: FileHandle,
 }
 
+enum OpenFile {
+    Typed(TypedOpenFile),
+    Pass(PassOpenFile),
+}
+
 #[derive(Clone)]
-struct OpenFile {
+struct TypedOpenFile {
     path: DocPath,
     staged: Vec<u8>,
     dirty: bool,
+    writable: bool,
+}
+
+struct PassOpenFile {
+    file: File,
     writable: bool,
 }
 
@@ -59,16 +73,25 @@ pub enum Error {
     Json(serde_json::Error),
     Yaml(serde_yaml::Error),
     Utf8(std::str::Utf8Error),
+    Io(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, Error>;
 
 impl SqliteFs {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let path = path.as_ref();
+        Self::open_with_backing(path, default_backing_path(path))
+    }
+
+    pub fn open_with_backing(db: impl AsRef<Path>, backing: impl AsRef<Path>) -> Result<Self> {
+        let backing = backing.as_ref().to_path_buf();
+        fs::create_dir_all(&backing)?;
+        let conn = Connection::open(db)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
+            backing,
             inner: Mutex::new(Inner {
                 conn,
                 handles: HashMap::new(),
@@ -88,14 +111,21 @@ impl SqliteFs {
         if handle == NO_HANDLE {
             return Ok(());
         }
-        let Some(open) = inner.handles.get(&handle).cloned() else {
+        let Some(open) = inner.handles.get(&handle) else {
             return Err(FsError::BadFileDescriptor.into());
         };
-        if open.dirty {
-            commit_document(&mut inner.conn, &open.path, &open.staged)?;
-            if let Some(open) = inner.handles.get_mut(&handle) {
+        let typed_commit = match open {
+            OpenFile::Typed(open) if open.dirty => Some((open.path.clone(), open.staged.clone())),
+            _ => None,
+        };
+        if let Some((path, staged)) = typed_commit {
+            commit_document(&mut inner.conn, &path, &staged)?;
+            if let Some(OpenFile::Typed(open)) = inner.handles.get_mut(&handle) {
                 open.dirty = false;
             }
+        }
+        if let Some(OpenFile::Pass(open)) = inner.handles.get_mut(&handle) {
+            open.file.sync_data()?;
         }
         Ok(())
     }
@@ -149,34 +179,19 @@ impl FileSystem for SqliteFs {
     }
 
     fn mknod(&self, path: &str, _mode: u32, _rdev: u64) -> FsResult<()> {
-        let doc = parse_doc_path(path).map_err(to_fs_error)?;
-        let mut inner = self.inner.lock().unwrap();
-        if document_exists(&inner.conn, &doc).map_err(to_fs_error)? {
-            return Err(FsError::Exists);
-        }
-        commit_document(&mut inner.conn, &doc, b"").map_err(to_fs_error)
+        self.try_mknod(path).map_err(to_fs_error)
+    }
+
+    fn mkdir(&self, path: &str, _mode: u32) -> FsResult<()> {
+        self.try_mkdir(path).map_err(to_fs_error)
     }
 
     fn unlink(&self, path: &str) -> FsResult<()> {
-        let doc = parse_doc_path(path).map_err(to_fs_error)?;
-        let inner = self.inner.lock().unwrap();
-        let schema = table_schema(&inner.conn, &doc.table).map_err(to_fs_error)?;
-        let changed = inner
-            .conn
-            .execute(
-                &format!(
-                    "DELETE FROM {} WHERE {} = ?1",
-                    quote_ident(&schema.name),
-                    quote_ident("_slfs_path")
-                ),
-                params![doc.file],
-            )
-            .map_err(|err| to_fs_error(err.into()))?;
-        if changed == 0 {
-            Err(FsError::NotFound)
-        } else {
-            Ok(())
-        }
+        self.try_unlink(path).map_err(to_fs_error)
+    }
+
+    fn rmdir(&self, path: &str) -> FsResult<()> {
+        self.try_rmdir(path).map_err(to_fs_error)
     }
 
     fn rename(&self, from: &str, to: &str, _flags: RenameFlags) -> FsResult<()> {
@@ -203,101 +218,125 @@ impl FileSystem for SqliteFs {
 impl SqliteFs {
     fn try_getattr(&self, path: &str) -> Result<Attr> {
         let inner = self.inner.lock().unwrap();
-        match parse_path(path)? {
-            VPath::Root => Ok(Attr::directory()),
-            VPath::Table(table) => {
-                table_schema(&inner.conn, &table)?;
-                Ok(Attr::directory())
-            }
-            VPath::File(doc) => {
-                if let Some(open) = inner
-                    .handles
-                    .values()
-                    .find(|open| open.path == doc && open.dirty)
-                {
-                    return Ok(Attr::file(open.staged.len() as u64));
-                }
-                match render_document(&inner.conn, &doc) {
-                    Ok(rendered) => Ok(Attr::file(rendered.len() as u64)),
-                    Err(Error::Fs(FsError::NotFound)) => inner
-                        .handles
-                        .values()
-                        .find(|open| open.path == doc)
-                        .map(|open| Attr::file(open.staged.len() as u64))
-                        .ok_or_else(|| FsError::NotFound.into()),
-                    Err(err) => Err(err),
-                }
-            }
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Root | Route::TableDir(_) => Ok(Attr::directory()),
+            Route::Typed(doc) => self.typed_attr(&inner, &doc),
+            Route::Pass(path) => Ok(attr_from_metadata(&fs::metadata(path)?)),
+        }
+    }
+
+    fn typed_attr(&self, inner: &Inner, doc: &DocPath) -> Result<Attr> {
+        if let Some(open) = inner.handles.values().find_map(|open| match open {
+            OpenFile::Typed(open) if open.path == *doc && open.dirty => Some(open),
+            _ => None,
+        }) {
+            return Ok(Attr::file(open.staged.len() as u64));
+        }
+        match render_document(&inner.conn, doc) {
+            Ok(rendered) => Ok(Attr::file(rendered.len() as u64)),
+            Err(Error::Fs(FsError::NotFound)) => inner
+                .handles
+                .values()
+                .find_map(|open| match open {
+                    OpenFile::Typed(open) if open.path == *doc => {
+                        Some(Attr::file(open.staged.len() as u64))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| FsError::NotFound.into()),
+            Err(err) => Err(err),
         }
     }
 
     fn try_readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
         let inner = self.inner.lock().unwrap();
-        match parse_path(path)? {
-            VPath::Root => eligible_tables(&inner.conn)
-                .map(|tables| tables.into_iter().map(DirEntry::directory).collect()),
-            VPath::Table(table) => {
-                let schema = table_schema(&inner.conn, &table)?;
-                let mut stmt = inner.conn.prepare(&format!(
-                    "SELECT {} FROM {} WHERE {} LIKE '%.md' ORDER BY {}",
-                    quote_ident("_slfs_path"),
-                    quote_ident(&schema.name),
-                    quote_ident("_slfs_path"),
-                    quote_ident("_slfs_path")
-                ))?;
-                let mut rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-                for open in inner.handles.values() {
-                    if open.path.table == table {
-                        rows.insert(open.path.file.clone());
-                    }
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Root => {
+                let mut entries = pass_dir_entries(&self.backing)?;
+                for table in eligible_tables(&inner.conn)? {
+                    entries.insert(table, EntryKind::Directory);
                 }
-                Ok(rows.into_iter().map(DirEntry::file).collect())
+                Ok(entries_to_dir_entries(entries))
             }
-            VPath::File(_) => Err(FsError::NotDirectory.into()),
+            Route::TableDir(table) => {
+                let mut entries = pass_dir_entries(&self.backing.join(&table))?;
+                for file in typed_files(&inner, &table)? {
+                    entries.insert(file, EntryKind::File);
+                }
+                Ok(entries_to_dir_entries(entries))
+            }
+            Route::Pass(path) => Ok(entries_to_dir_entries(pass_dir_entries(&path)?)),
+            Route::Typed(_) => Err(FsError::NotDirectory.into()),
         }
     }
 
     fn try_open(&self, path: &str, options: OpenOptions) -> Result<FileHandle> {
-        let doc = parse_doc_path(path)?;
         let mut inner = self.inner.lock().unwrap();
-        let mut staged = render_document(&inner.conn, &doc)?.into_bytes();
-        let mut dirty = false;
-        if options.truncate() {
-            if !options.writable() {
-                return Err(FsError::InvalidInput.into());
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Typed(doc) => {
+                let mut staged = render_document(&inner.conn, &doc)?.into_bytes();
+                let mut dirty = false;
+                if options.truncate() {
+                    if !options.writable() {
+                        return Err(FsError::InvalidInput.into());
+                    }
+                    staged.clear();
+                    dirty = true;
+                }
+                Ok(Self::alloc_handle(
+                    &mut inner,
+                    OpenFile::Typed(TypedOpenFile {
+                        path: doc,
+                        staged,
+                        dirty,
+                        writable: options.writable(),
+                    }),
+                ))
             }
-            staged.clear();
-            dirty = true;
+            Route::Pass(path) => {
+                let file = open_pass_file(&path, options, false)?;
+                Ok(Self::alloc_handle(
+                    &mut inner,
+                    OpenFile::Pass(PassOpenFile {
+                        file,
+                        writable: options.writable(),
+                    }),
+                ))
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::IsDirectory.into()),
         }
-        Ok(Self::alloc_handle(
-            &mut inner,
-            OpenFile {
-                path: doc,
-                staged,
-                dirty,
-                writable: options.writable(),
-            },
-        ))
     }
 
     fn try_create(&self, path: &str, options: OpenOptions) -> Result<FileHandle> {
-        let doc = parse_doc_path(path)?;
         let mut inner = self.inner.lock().unwrap();
-        table_schema(&inner.conn, &doc.table)?;
-        if document_exists(&inner.conn, &doc)? {
-            return Err(FsError::Exists.into());
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Typed(doc) => {
+                if document_exists(&inner.conn, &doc)? {
+                    return Err(FsError::Exists.into());
+                }
+                Ok(Self::alloc_handle(
+                    &mut inner,
+                    OpenFile::Typed(TypedOpenFile {
+                        path: doc,
+                        staged: Vec::new(),
+                        dirty: true,
+                        writable: options.writable(),
+                    }),
+                ))
+            }
+            Route::Pass(path) => {
+                ensure_virtual_parent(&inner.conn, &self.backing, path_to_str(&path)?)?;
+                let file = open_pass_file(&path, options, true)?;
+                Ok(Self::alloc_handle(
+                    &mut inner,
+                    OpenFile::Pass(PassOpenFile {
+                        file,
+                        writable: options.writable(),
+                    }),
+                ))
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::IsDirectory.into()),
         }
-        Ok(Self::alloc_handle(
-            &mut inner,
-            OpenFile {
-                path: doc,
-                staged: Vec::new(),
-                dirty: true,
-                writable: options.writable(),
-            },
-        ))
     }
 
     fn try_read(
@@ -307,18 +346,31 @@ impl SqliteFs {
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>> {
-        let inner = self.inner.lock().unwrap();
-        let data = if handle != NO_HANDLE {
-            inner
+        if handle != NO_HANDLE {
+            let mut inner = self.inner.lock().unwrap();
+            let open = inner
                 .handles
-                .get(&handle)
-                .ok_or(FsError::BadFileDescriptor)?
-                .staged
-                .clone()
-        } else {
-            render_document(&inner.conn, &parse_doc_path(path)?)?.into_bytes()
-        };
-        read_slice(&data, offset, size)
+                .get_mut(&handle)
+                .ok_or(FsError::BadFileDescriptor)?;
+            return match open {
+                OpenFile::Typed(open) => read_slice(&open.staged, offset, size),
+                OpenFile::Pass(open) => read_pass_file(&mut open.file, offset, size),
+            };
+        }
+
+        let inner = self.inner.lock().unwrap();
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Typed(doc) => read_slice(
+                &render_document(&inner.conn, &doc)?.into_bytes(),
+                offset,
+                size,
+            ),
+            Route::Pass(path) => {
+                let mut file = File::open(path)?;
+                read_pass_file(&mut file, offset, size)
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::IsDirectory.into()),
+        }
     }
 
     fn try_write(&self, handle: FileHandle, offset: u64, input: &[u8]) -> Result<usize> {
@@ -327,38 +379,125 @@ impl SqliteFs {
             .handles
             .get_mut(&handle)
             .ok_or(FsError::BadFileDescriptor)?;
-        if !open.writable {
-            return Err(FsError::BadFileDescriptor.into());
+        match open {
+            OpenFile::Typed(open) => {
+                if !open.writable {
+                    return Err(FsError::BadFileDescriptor.into());
+                }
+                let start = usize::try_from(offset).map_err(|_| FsError::InvalidInput)?;
+                let end = start
+                    .checked_add(input.len())
+                    .ok_or(FsError::FileTooLarge)?;
+                if end > open.staged.len() {
+                    open.staged.resize(end, 0);
+                }
+                open.staged[start..end].copy_from_slice(input);
+                open.dirty = true;
+                Ok(input.len())
+            }
+            OpenFile::Pass(open) => {
+                if !open.writable {
+                    return Err(FsError::BadFileDescriptor.into());
+                }
+                open.file.seek(SeekFrom::Start(offset))?;
+                open.file.write_all(input)?;
+                Ok(input.len())
+            }
         }
-        let start = usize::try_from(offset).map_err(|_| FsError::InvalidInput)?;
-        let end = start
-            .checked_add(input.len())
-            .ok_or(FsError::FileTooLarge)?;
-        if end > open.staged.len() {
-            open.staged.resize(end, 0);
-        }
-        open.staged[start..end].copy_from_slice(input);
-        open.dirty = true;
-        Ok(input.len())
     }
 
     fn try_truncate(&self, path: &str, handle: Option<FileHandle>, size: u64) -> Result<()> {
-        let size = usize::try_from(size).map_err(|_| FsError::FileTooLarge)?;
+        let size_usize = usize::try_from(size).map_err(|_| FsError::FileTooLarge)?;
         let mut inner = self.inner.lock().unwrap();
         if let Some(handle) = handle {
             let open = inner
                 .handles
                 .get_mut(&handle)
                 .ok_or(FsError::BadFileDescriptor)?;
-            open.staged.resize(size, 0);
-            open.dirty = true;
-            return Ok(());
+            return match open {
+                OpenFile::Typed(open) => {
+                    open.staged.resize(size_usize, 0);
+                    open.dirty = true;
+                    Ok(())
+                }
+                OpenFile::Pass(open) => {
+                    open.file.set_len(size)?;
+                    Ok(())
+                }
+            };
         }
 
-        let doc = parse_doc_path(path)?;
-        let mut staged = render_document(&inner.conn, &doc)?.into_bytes();
-        staged.resize(size, 0);
-        commit_document(&mut inner.conn, &doc, &staged)
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Typed(doc) => {
+                let mut staged = render_document(&inner.conn, &doc)?.into_bytes();
+                staged.resize(size_usize, 0);
+                commit_document(&mut inner.conn, &doc, &staged)
+            }
+            Route::Pass(path) => {
+                let file = StdOpenOptions::new().write(true).open(path)?;
+                file.set_len(size)?;
+                Ok(())
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::IsDirectory.into()),
+        }
+    }
+
+    fn try_mknod(&self, path: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Typed(doc) => {
+                if document_exists(&inner.conn, &doc)? {
+                    return Err(FsError::Exists.into());
+                }
+                commit_document(&mut inner.conn, &doc, b"")
+            }
+            Route::Pass(path) => {
+                ensure_virtual_parent(&inner.conn, &self.backing, path_to_str(&path)?)?;
+                StdOpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                Ok(())
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::IsDirectory.into()),
+        }
+    }
+
+    fn try_mkdir(&self, path: &str) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Pass(path) => {
+                ensure_virtual_parent(&inner.conn, &self.backing, path_to_str(&path)?)?;
+                fs::create_dir(path)?;
+                Ok(())
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::Exists.into()),
+            Route::Typed(_) => Err(FsError::NotDirectory.into()),
+        }
+    }
+
+    fn try_unlink(&self, path: &str) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Typed(doc) => delete_typed(&inner.conn, &doc),
+            Route::Pass(path) => {
+                fs::remove_file(path)?;
+                Ok(())
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::IsDirectory.into()),
+        }
+    }
+
+    fn try_rmdir(&self, path: &str) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Pass(path) => {
+                fs::remove_dir(path)?;
+                Ok(())
+            }
+            Route::Root | Route::TableDir(_) => Err(FsError::PermissionDenied.into()),
+            Route::Typed(_) => Err(FsError::NotDirectory.into()),
+        }
     }
 
     fn try_metadata_noop(&self, path: &str, handle: Option<FileHandle>) -> Result<()> {
@@ -369,57 +508,255 @@ impl SqliteFs {
             }
             return Err(FsError::BadFileDescriptor.into());
         }
-        match parse_path(path)? {
-            VPath::Root => Ok(()),
-            VPath::Table(table) => table_schema(&inner.conn, &table).map(|_| ()),
-            VPath::File(doc) => document_exists(&inner.conn, &doc).and_then(|exists| {
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Root | Route::TableDir(_) => Ok(()),
+            Route::Typed(doc) => document_exists(&inner.conn, &doc).and_then(|exists| {
                 if exists {
                     Ok(())
                 } else {
                     Err(FsError::NotFound.into())
                 }
             }),
+            Route::Pass(path) => fs::metadata(path).map(|_| ()).map_err(Into::into),
         }
     }
 
     fn try_rename(&self, from: &str, to: &str) -> Result<()> {
-        let from = parse_doc_path(from)?;
-        let to = parse_doc_path(to)?;
-        if from.table != to.table {
-            return Err(FsError::Unsupported.into());
-        }
         let mut inner = self.inner.lock().unwrap();
-        let schema = table_schema(&inner.conn, &from.table)?;
-        let tx = inner.conn.transaction()?;
-        tx.execute(
-            &format!(
-                "DELETE FROM {} WHERE {} = ?1",
-                quote_ident(&schema.name),
-                quote_ident("_slfs_path")
-            ),
-            params![to.file],
-        )?;
-        let changed = tx.execute(
-            &format!(
-                "UPDATE {} SET {} = ?1 WHERE {} = ?2",
-                quote_ident(&schema.name),
-                quote_ident("_slfs_path"),
-                quote_ident("_slfs_path")
-            ),
-            params![to.file, from.file],
-        )?;
-        tx.commit()?;
-        if changed == 0 {
-            Err(FsError::NotFound.into())
-        } else {
-            for open in inner.handles.values_mut() {
-                if open.path == from {
-                    open.path = to.clone();
-                }
+        match (
+            route(&inner.conn, &self.backing, from)?,
+            route(&inner.conn, &self.backing, to)?,
+        ) {
+            (Route::Typed(from), Route::Typed(to)) => rename_typed(&mut inner, from, to),
+            (Route::Pass(from_path), Route::Pass(to_path)) => {
+                ensure_virtual_parent(&inner.conn, &self.backing, path_to_str(&to_path)?)?;
+                fs::rename(from_path, to_path)?;
+                Ok(())
             }
-            Ok(())
+            _ => Err(FsError::Unsupported.into()),
         }
     }
+}
+
+fn default_backing_path(db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.files", db.display()))
+}
+
+#[derive(Debug)]
+enum Route {
+    Root,
+    TableDir(String),
+    Typed(DocPath),
+    Pass(PathBuf),
+}
+
+fn route(conn: &Connection, backing: &Path, path: &str) -> Result<Route> {
+    if path == "/" {
+        return Ok(Route::Root);
+    }
+    let parts = path_components(path)?;
+    if parts.len() == 1 && table_schema(conn, &parts[0]).is_ok() {
+        return Ok(Route::TableDir(parts[0].clone()));
+    }
+    if parts.len() == 2
+        && is_typed_file_name(&parts[1])
+        && validate_ident(&parts[0]).is_ok()
+        && table_schema(conn, &parts[0]).is_ok()
+    {
+        return Ok(Route::Typed(DocPath {
+            table: parts[0].clone(),
+            file: parts[1].clone(),
+        }));
+    }
+    Ok(Route::Pass(backing.join(parts.iter().collect::<PathBuf>())))
+}
+
+fn path_components(path: &str) -> Result<Vec<String>> {
+    let trimmed = path.strip_prefix('/').ok_or(FsError::InvalidInput)?;
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(FsError::InvalidInput.into());
+    }
+    let mut parts = Vec::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(FsError::InvalidInput.into());
+        }
+        parts.push(part.to_string());
+    }
+    Ok(parts)
+}
+
+fn is_typed_file_name(name: &str) -> bool {
+    name.ends_with(".md")
+        && !name.starts_with("._")
+        && name != ".DS_Store"
+        && !name.contains('/')
+        && !name.contains('\0')
+        && name.len() <= 255
+}
+
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str().ok_or(FsError::InvalidInput.into())
+}
+
+fn ensure_virtual_parent(conn: &Connection, backing: &Path, path: &str) -> Result<()> {
+    let relative = Path::new(path)
+        .strip_prefix(backing)
+        .map_err(|_| FsError::InvalidInput)?;
+    let parts = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    if parts.len() >= 2 && table_schema(conn, &parts[0]).is_ok() {
+        fs::create_dir_all(backing.join(&parts[0]))?;
+    }
+    Ok(())
+}
+
+fn attr_from_metadata(metadata: &fs::Metadata) -> Attr {
+    let kind = if metadata.is_dir() {
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    Attr {
+        kind,
+        len: metadata.len(),
+        perm: (metadata.mode() & 0o777) as u16,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        accessed: metadata.accessed().unwrap_or_else(|_| SystemTime::now()),
+        modified: metadata.modified().unwrap_or_else(|_| SystemTime::now()),
+        changed: SystemTime::now(),
+        created: metadata.created().unwrap_or_else(|_| SystemTime::now()),
+    }
+}
+
+fn pass_dir_entries(path: &Path) -> Result<BTreeMap<String, EntryKind>> {
+    let mut entries = BTreeMap::new();
+    match fs::read_dir(path) {
+        Ok(read_dir) => {
+            for entry in read_dir {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let kind = if entry.file_type()?.is_dir() {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                entries.insert(name, kind);
+            }
+            Ok(entries)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(entries),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn typed_files(inner: &Inner, table: &str) -> Result<BTreeSet<String>> {
+    let schema = table_schema(&inner.conn, table)?;
+    let mut stmt = inner.conn.prepare(&format!(
+        "SELECT {} FROM {} WHERE {} LIKE '%.md' ORDER BY {}",
+        quote_ident("_slfs_path"),
+        quote_ident(&schema.name),
+        quote_ident("_slfs_path"),
+        quote_ident("_slfs_path")
+    ))?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    for open in inner.handles.values() {
+        if let OpenFile::Typed(open) = open {
+            if open.path.table == table {
+                rows.insert(open.path.file.clone());
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn entries_to_dir_entries(entries: BTreeMap<String, EntryKind>) -> Vec<DirEntry> {
+    entries
+        .into_iter()
+        .map(|(name, kind)| match kind {
+            EntryKind::Directory => DirEntry::directory(name),
+            EntryKind::File => DirEntry::file(name),
+        })
+        .collect()
+}
+
+fn open_pass_file(path: &Path, options: OpenOptions, create: bool) -> Result<File> {
+    let mut open = StdOpenOptions::new();
+    open.read(options.readable() || options.writable())
+        .write(options.writable())
+        .append(options.append())
+        .truncate(options.truncate());
+    if create {
+        open.create_new(true).write(true).read(true);
+    }
+    Ok(open.open(path)?)
+}
+
+fn read_pass_file(file: &mut File, offset: u64, size: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut out = vec![0; size];
+    let len = file.read(&mut out)?;
+    out.truncate(len);
+    Ok(out)
+}
+
+fn delete_typed(conn: &Connection, doc: &DocPath) -> Result<()> {
+    let schema = table_schema(conn, &doc.table)?;
+    let changed = conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE {} = ?1",
+            quote_ident(&schema.name),
+            quote_ident("_slfs_path")
+        ),
+        params![doc.file],
+    )?;
+    if changed == 0 {
+        Err(FsError::NotFound.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath) -> Result<()> {
+    if from.table != to.table {
+        return Err(FsError::Unsupported.into());
+    }
+    let schema = table_schema(&inner.conn, &from.table)?;
+    let tx = inner.conn.transaction()?;
+    tx.execute(
+        &format!(
+            "DELETE FROM {} WHERE {} = ?1",
+            quote_ident(&schema.name),
+            quote_ident("_slfs_path")
+        ),
+        params![to.file],
+    )?;
+    let changed = tx.execute(
+        &format!(
+            "UPDATE {} SET {} = ?1 WHERE {} = ?2",
+            quote_ident(&schema.name),
+            quote_ident("_slfs_path"),
+            quote_ident("_slfs_path")
+        ),
+        params![to.file, from.file],
+    )?;
+    tx.commit()?;
+    if changed == 0 {
+        return Err(FsError::NotFound.into());
+    }
+    for open in inner.handles.values_mut() {
+        if let OpenFile::Typed(open) = open {
+            if open.path == from {
+                open.path = to.clone();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn commit_document(conn: &mut Connection, doc: &DocPath, bytes: &[u8]) -> Result<()> {
@@ -789,46 +1126,6 @@ impl Column {
     }
 }
 
-enum VPath {
-    Root,
-    Table(String),
-    File(DocPath),
-}
-
-fn parse_path(path: &str) -> Result<VPath> {
-    if path == "/" {
-        return Ok(VPath::Root);
-    }
-    let trimmed = path.strip_prefix('/').ok_or(FsError::InvalidInput)?;
-    if trimmed.is_empty() || trimmed.ends_with('/') {
-        return Err(FsError::NotFound.into());
-    }
-    let parts = trimmed.split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        [table] => {
-            validate_ident(table)?;
-            Ok(VPath::Table((*table).to_string()))
-        }
-        [table, file] if file.ends_with(".md") => {
-            validate_ident(table)?;
-            validate_file_name(file)?;
-            Ok(VPath::File(DocPath {
-                table: (*table).to_string(),
-                file: (*file).to_string(),
-            }))
-        }
-        [_, _] => Err(FsError::NotFound.into()),
-        _ => Err(FsError::NotDirectory.into()),
-    }
-}
-
-fn parse_doc_path(path: &str) -> Result<DocPath> {
-    match parse_path(path)? {
-        VPath::File(doc) => Ok(doc),
-        VPath::Root | VPath::Table(_) => Err(FsError::IsDirectory.into()),
-    }
-}
-
 fn validate_ident(name: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.len() <= 255
@@ -837,20 +1134,6 @@ fn validate_ident(name: &str) -> Result<()> {
         Ok(())
     } else {
         Err(FsError::InvalidInput.into())
-    }
-}
-
-fn validate_file_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 255
-        || name.contains('/')
-        || name.contains('\0')
-        || name.starts_with("._")
-        || name == ".DS_Store"
-    {
-        Err(FsError::NotFound.into())
-    } else {
-        Ok(())
     }
 }
 
@@ -984,6 +1267,17 @@ fn to_fs_error(err: Error) -> FsError {
         Error::Fs(err) => err,
         Error::Yaml(_) | Error::Utf8(_) => FsError::InvalidInput,
         Error::Sql(_) | Error::Json(_) => FsError::Io,
+        Error::Io(err) => io_to_fs_error(err),
+    }
+}
+
+fn io_to_fs_error(err: std::io::Error) -> FsError {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => FsError::NotFound,
+        std::io::ErrorKind::AlreadyExists => FsError::Exists,
+        std::io::ErrorKind::PermissionDenied => FsError::PermissionDenied,
+        std::io::ErrorKind::InvalidInput => FsError::InvalidInput,
+        _ => FsError::Io,
     }
 }
 
@@ -1017,6 +1311,12 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Error::Io(value)
+    }
+}
+
 trait Pipe: Sized {
     fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
         f(self)
@@ -1031,7 +1331,10 @@ mod tests {
     fn test_fs(schema: &str) -> SqliteFs {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema).unwrap();
+        let backing = std::env::temp_dir().join(format!("sqlite-fs-test-{}", short_suffix()));
+        fs::create_dir_all(&backing).unwrap();
         SqliteFs {
+            backing,
             inner: Mutex::new(Inner {
                 conn,
                 handles: HashMap::new(),
@@ -1065,19 +1368,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_top_level_markdown_paths() {
-        assert!(matches!(parse_path("/contacts"), Ok(VPath::Table(_))));
+    fn routes_typed_files_and_passthrough_paths() {
+        let fs = test_fs(contact_schema());
+        let inner = fs.inner.lock().unwrap();
         assert!(matches!(
-            parse_path("/contacts/noorvir.md"),
-            Ok(VPath::File(_))
+            route(&inner.conn, &fs.backing, "/contacts"),
+            Ok(Route::TableDir(_))
         ));
         assert!(matches!(
-            parse_path("/contacts/noorvir.txt"),
-            Err(Error::Fs(FsError::NotFound))
+            route(&inner.conn, &fs.backing, "/contacts/noorvir.md"),
+            Ok(Route::Typed(_))
         ));
         assert!(matches!(
-            parse_path("/contacts/friends/noorvir.md"),
-            Err(Error::Fs(FsError::NotDirectory))
+            route(&inner.conn, &fs.backing, "/contacts/noorvir.txt"),
+            Ok(Route::Pass(_))
+        ));
+        assert!(matches!(
+            route(&inner.conn, &fs.backing, "/contacts/friends/noorvir.md"),
+            Ok(Route::Pass(_))
+        ));
+        assert!(matches!(
+            route(&inner.conn, &fs.backing, "/.obsidian/app.json"),
+            Ok(Route::Pass(_))
         ));
     }
 
@@ -1287,5 +1599,48 @@ mod tests {
         assert_eq!(age, 37);
         assert_eq!(invalid["age"]["attempted"], JsonValue::from("38"));
         assert_eq!(invalid["age"]["error"], JsonValue::from("must be integer"));
+    }
+
+    #[test]
+    fn passthrough_supports_hidden_app_metadata() {
+        let fs = test_fs(contact_schema());
+        fs.mkdir("/.obsidian", 0o755).unwrap();
+        create_doc(&fs, "/.obsidian/app.json", "{}\n");
+
+        assert_eq!(
+            fs.read("/.obsidian/app.json", NO_HANDLE, 0, 100).unwrap(),
+            b"{}\n"
+        );
+        assert!(fs.backing.join(".obsidian/app.json").exists());
+    }
+
+    #[test]
+    fn passthrough_works_inside_table_folders_for_non_typed_paths() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: Noorvir\n---\nBody\n",
+        );
+        fs.mkdir("/contacts/nested", 0o755).unwrap();
+        create_doc(&fs, "/contacts/nested/pass.md", "pass\n");
+        create_doc(&fs, "/contacts/ignored.txt", "x");
+
+        let entries = fs
+            .readdir("/contacts")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert!(entries.contains(&"noorvir.md".to_string()));
+        assert!(entries.contains(&"nested".to_string()));
+        assert!(entries.contains(&"ignored.txt".to_string()));
+
+        let inner = fs.inner.lock().unwrap();
+        let row_count: i64 = inner
+            .conn
+            .query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
     }
 }
