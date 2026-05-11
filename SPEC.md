@@ -6,13 +6,29 @@ Implementation details not covered by the README.
 
 Typed primitive files are UTF-8 Markdown only.
 
-Use an explicit encoding column:
+Expose only top-level Markdown files:
 
-```sql
-encoding TEXT NOT NULL DEFAULT 'utf-8'
+```txt
+/{table}/{file}.md
 ```
 
-Binary files and attachments are out of scope for typed primitives.
+Nested paths and non-`.md` files are out of scope and should fail normally, e.g. `ENOENT` or `ENOTDIR`.
+
+The root lists eligible tables. A table folder lists rows by `_slfs_path`.
+
+A table is exposed as a folder when it has:
+
+```sql
+_slfs_path TEXT UNIQUE NOT NULL,
+_slfs_content TEXT NOT NULL DEFAULT '',
+_slfs_invalid_update TEXT NOT NULL DEFAULT '{}'
+```
+
+The folder name is the table name. `_slfs_path` is the filename inside it.
+
+`_slfs_` is reserved for sqlite-fs metadata. Do not expose those columns as editable properties.
+
+All non-`_slfs_` columns are domain properties. Rust must not contain domain-specific names.
 
 ## POSIX write lifecycle
 
@@ -27,13 +43,15 @@ flush/fsync/release        -> parse once + SQLite transaction
 
 The semantic commit boundary is `flush`, `fsync`, or `release/close`.
 
+Reads through the same open handle may see staged bytes. Other handles see committed state.
+
 If commit fails, report the filesystem operation as failed and roll back.
 
 ## Efficient parsing
 
 Only the Markdown properties/frontmatter block needs structured parsing.
 
-The rest of the file is body `content`.
+The rest of the file is body `_slfs_content`.
 
 Future optimization:
 
@@ -57,6 +75,10 @@ split into valid properties + invalid properties
 
 Only valid values should be written to constrained canonical columns.
 
+Invalid values are stored in `_slfs_invalid_update`.
+
+Unknown properties are invalid updates too.
+
 SQLite constraints remain guardrails for bugs/races.
 
 ## Constraint recovery
@@ -67,9 +89,9 @@ Example:
 
 ```txt
 BEGIN
-check attempted email uniqueness
-if unique: update contacts.email
-else: store attempted email in invalid_update
+check attempted unique field
+if unique: update canonical column
+else: store attempted value in _slfs_invalid_update
 COMMIT
 ```
 
@@ -80,11 +102,23 @@ SAVEPOINT apply_field
 try canonical update
 on SQLITE_CONSTRAINT:
   ROLLBACK TO apply_field
-  write attempted value to invalid_update
+  write attempted value to _slfs_invalid_update
 RELEASE apply_field
 ```
 
-The goal is to convert semantic conflicts into `invalid_update`, not fail the whole write.
+The goal is to convert semantic conflicts into `_slfs_invalid_update`, not fail the whole write.
+
+## New rows
+
+Use provided Markdown values first, then SQLite defaults, then generic type defaults.
+
+Generic type defaults are best effort: text -> `untitled-a1b2c`, number -> `0`, blob -> empty.
+
+Visible generated placeholders should be human-ish, never `_slfs_`-prefixed.
+
+Schemas with CHECK constraints should provide compatible defaults.
+
+If SQL constraints still reject insertion, the filesystem write fails.
 
 ## Concurrency
 
@@ -96,11 +130,17 @@ Keep write transactions short:
 parse outside transaction
 BEGIN IMMEDIATE
 preflight DB-backed constraints
-apply valid updates + invalid_update
+apply valid updates + _slfs_invalid_update
 COMMIT
 ```
 
 If needed, serialize filesystem commits through a single writer queue.
+
+## Unsupported operations
+
+Unsupported POSIX operations return ordinary errors such as `ENOSYS`; the mount must not crash.
+
+Panics and malformed callback input must be converted to ordinary filesystem errors.
 
 ## Future work
 

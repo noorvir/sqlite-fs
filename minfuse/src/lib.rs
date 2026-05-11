@@ -473,7 +473,15 @@ pub fn mount(
     mountpoint: impl AsRef<Path>,
     options: MountOptions,
 ) -> io::Result<()> {
-    let mut state = Box::new(MountState { fs: Box::new(fs) });
+    mount_boxed(Box::new(fs), mountpoint, options)
+}
+
+pub fn mount_boxed(
+    fs: Box<dyn FileSystem>,
+    mountpoint: impl AsRef<Path>,
+    options: MountOptions,
+) -> io::Result<()> {
+    let mut state = Box::new(MountState { fs });
     let state_ptr = (&mut *state) as *mut MountState as *mut c_void;
 
     let mut args = vec!["minfuse".to_string()];
@@ -490,6 +498,8 @@ pub fn mount(
     if options.local {
         args.extend(["-o".to_string(), "local".to_string()]);
     }
+    args.extend(["-o".to_string(), "noappledouble".to_string()]);
+    args.extend(["-o".to_string(), "noapplexattr".to_string()]);
     args.extend(["-o".to_string(), format!("volname={}", options.volname)]);
     args.push(mountpoint.as_ref().to_string_lossy().to_string());
 
