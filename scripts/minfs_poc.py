@@ -84,7 +84,33 @@ def main():
         got = run(["cat", mountpoint / "hello.txt"]).stdout
         if got != "written through mount\n":
             raise RuntimeError(f"unexpected content: {got!r}")
-        print("PASS: Rust macFUSE FSKit read/write works without the macFUSE kext")
+
+        run(["mkdir", mountpoint / "Contacts"])
+        run(["sh", "-c", 'printf "Ada\n" > "$1/Contacts/Ada.md"', "sh", mountpoint])
+        run(["mv", mountpoint / "Contacts/Ada.md", mountpoint / "Contacts/Ada Lovelace.md"])
+        got = run(["cat", mountpoint / "Contacts/Ada Lovelace.md"]).stdout
+        if got != "Ada\n":
+            raise RuntimeError(f"unexpected created content: {got!r}")
+        run(["rm", mountpoint / "Contacts/Ada Lovelace.md"])
+        run(["rmdir", mountpoint / "Contacts"])
+
+        for unsupported in [
+            ["ln", "-s", "hello.txt", mountpoint / "hello-link"],
+            ["ln", mountpoint / "hello.txt", mountpoint / "hello-hardlink"],
+        ]:
+            result = run(unsupported, check=False)
+            if result.returncode == 0:
+                raise RuntimeError("unsupported operation unexpectedly succeeded: " + " ".join(map(str, unsupported)))
+
+        # macFUSE may handle some metadata internally. Whether this succeeds or
+        # returns an ordinary error, it must not take down the mounted process.
+        run(["xattr", "-w", "user.minfs", "value", mountpoint / "hello.txt"], check=False)
+
+        got = run(["cat", mountpoint / "hello.txt"]).stdout
+        if got != "written through mount\n":
+            raise RuntimeError("mount did not survive unsupported operations")
+
+        print("PASS: Rust macFUSE FSKit read/write/create/rename/unsupported-op handling works without the macFUSE kext")
     finally:
         if proc.poll() is None:
             proc.terminate()
