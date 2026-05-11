@@ -43,7 +43,6 @@ def init_db(path):
     db.executescript(
         """
         CREATE TABLE contacts (
-          id INTEGER PRIMARY KEY,
           _slfs_path TEXT UNIQUE NOT NULL,
           _slfs_content TEXT NOT NULL DEFAULT '',
           _slfs_invalid_update TEXT NOT NULL DEFAULT '{}',
