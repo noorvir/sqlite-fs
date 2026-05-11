@@ -467,6 +467,10 @@ fn commit_document(conn: &mut Connection, doc: &DocPath, bytes: &[u8]) -> Result
             invalid.insert(name, invalid_entry(value, "unknown property"));
             continue;
         };
+        if let Some(error) = column.property_type_error(&value) {
+            invalid.insert(name, invalid_entry(value, error));
+            continue;
+        }
         match try_update_field(&tx, &schema, column, &doc.file, &value) {
             Ok(()) => {
                 invalid.remove(&name);
@@ -738,13 +742,50 @@ impl TableSchema {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnAffinity {
+    Text,
+    Integer,
+    Real,
+    Numeric,
+    Blob,
+}
+
 impl Column {
     fn needs_insert_value(&self) -> bool {
-        (self.not_null || (self.pk && !self.is_integer())) && !self.has_default
+        (self.not_null || (self.pk && self.affinity() != ColumnAffinity::Integer))
+            && !self.has_default
     }
 
-    fn is_integer(&self) -> bool {
-        self.decl_type.to_ascii_uppercase().contains("INT")
+    fn affinity(&self) -> ColumnAffinity {
+        let ty = self.decl_type.to_ascii_uppercase();
+        if ty.contains("INT") {
+            ColumnAffinity::Integer
+        } else if ty.contains("CHAR") || ty.contains("CLOB") || ty.contains("TEXT") {
+            ColumnAffinity::Text
+        } else if ty.contains("REAL") || ty.contains("FLOA") || ty.contains("DOUB") {
+            ColumnAffinity::Real
+        } else if ty.contains("BLOB") || ty.is_empty() {
+            ColumnAffinity::Blob
+        } else {
+            ColumnAffinity::Numeric
+        }
+    }
+
+    fn property_type_error(&self, value: &JsonValue) -> Option<&'static str> {
+        if value.is_null() {
+            return self.not_null.then_some("cannot be null");
+        }
+        match self.affinity() {
+            ColumnAffinity::Text => value.as_str().is_none().then_some("must be text"),
+            ColumnAffinity::Integer => (!is_json_integer(value)).then_some("must be integer"),
+            ColumnAffinity::Real => (!value.is_number()).then_some("must be number"),
+            ColumnAffinity::Numeric => value
+                .is_array()
+                .then_some("must be scalar")
+                .or_else(|| value.is_object().then_some("must be scalar")),
+            ColumnAffinity::Blob => Some("blob properties are unsupported"),
+        }
     }
 }
 
@@ -865,6 +906,14 @@ fn is_semantic_sql_error(err: &Error) -> bool {
     )
 }
 
+fn is_json_integer(value: &JsonValue) -> bool {
+    value
+        .as_i64()
+        .map(|_| true)
+        .or_else(|| value.as_u64().map(|n| i64::try_from(n).is_ok()))
+        .unwrap_or(false)
+}
+
 fn json_to_sql(value: &JsonValue) -> SqlValue {
     match value {
         JsonValue::Null => SqlValue::Null,
@@ -896,15 +945,11 @@ fn sql_to_json(value: &SqlValue) -> JsonValue {
 }
 
 fn generic_default(column: &Column) -> SqlValue {
-    let ty = column.decl_type.to_ascii_uppercase();
-    if column.is_integer() {
-        SqlValue::Integer(0)
-    } else if ty.contains("REAL") || ty.contains("FLOA") || ty.contains("DOUB") {
-        SqlValue::Real(0.0)
-    } else if ty.contains("BLOB") {
-        SqlValue::Blob(Vec::new())
-    } else {
-        SqlValue::Text(format!("untitled-{}", short_suffix()))
+    match column.affinity() {
+        ColumnAffinity::Integer => SqlValue::Integer(0),
+        ColumnAffinity::Real | ColumnAffinity::Numeric => SqlValue::Real(0.0),
+        ColumnAffinity::Blob => SqlValue::Blob(Vec::new()),
+        ColumnAffinity::Text => SqlValue::Text(format!("untitled-{}", short_suffix())),
     }
 }
 
@@ -983,6 +1028,42 @@ impl<T> Pipe for T {}
 mod tests {
     use super::*;
 
+    fn test_fs(schema: &str) -> SqliteFs {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema).unwrap();
+        SqliteFs {
+            inner: Mutex::new(Inner {
+                conn,
+                handles: HashMap::new(),
+                next_handle: 1,
+            }),
+        }
+    }
+
+    fn create_doc(fs: &SqliteFs, path: &str, text: &str) {
+        let handle = fs.create(path, 0o644, OpenOptions::from_raw(1)).unwrap();
+        fs.write(path, handle, 0, text.as_bytes()).unwrap();
+        fs.release(path, handle).unwrap();
+    }
+
+    fn overwrite_doc(fs: &SqliteFs, path: &str, text: &str) {
+        let handle = fs.open(path, OpenOptions::from_raw(1)).unwrap();
+        fs.truncate(path, Some(handle), 0).unwrap();
+        fs.write(path, handle, 0, text.as_bytes()).unwrap();
+        fs.release(path, handle).unwrap();
+    }
+
+    fn contact_schema() -> &'static str {
+        "CREATE TABLE contacts (
+            _slfs_path TEXT UNIQUE NOT NULL,
+            _slfs_content TEXT NOT NULL DEFAULT '',
+            _slfs_invalid_update TEXT NOT NULL DEFAULT '{}',
+            first_name TEXT NOT NULL DEFAULT 'untitled' CHECK(length(first_name) >= 1),
+            email TEXT UNIQUE,
+            age INTEGER NOT NULL DEFAULT 0 CHECK(age >= 0)
+        );"
+    }
+
     #[test]
     fn parses_only_top_level_markdown_paths() {
         assert!(matches!(parse_path("/contacts"), Ok(VPath::Table(_))));
@@ -1009,34 +1090,25 @@ mod tests {
     }
 
     #[test]
-    fn generic_sqlite_write_records_invalid_updates() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE contacts (
-                id INTEGER PRIMARY KEY,
-                _slfs_path TEXT UNIQUE NOT NULL,
-                _slfs_content TEXT NOT NULL DEFAULT '',
-                _slfs_invalid_update TEXT NOT NULL DEFAULT '{}',
-                first_name TEXT NOT NULL DEFAULT 'untitled' CHECK(length(first_name) >= 1),
-                email TEXT UNIQUE
-            );",
+    fn parses_yaml_scalar_edge_cases() {
+        let (props, _) = parse_markdown(
+            "---\nempty: \"\"\nbare_null:\nnumber: 123\nquoted_number: \"123\"\n---\n",
         )
         .unwrap();
-        let fs = SqliteFs {
-            inner: Mutex::new(Inner {
-                conn,
-                handles: HashMap::new(),
-                next_handle: 1,
-            }),
-        };
+        assert_eq!(props.get("empty"), Some(&JsonValue::from("")));
+        assert_eq!(props.get("bare_null"), Some(&JsonValue::Null));
+        assert_eq!(props.get("number"), Some(&JsonValue::from(123)));
+        assert_eq!(props.get("quoted_number"), Some(&JsonValue::from("123")));
+    }
 
-        let text =
-            b"---\nfirst_name: \"\"\nemail: noorvir@example.com\nunknown: value\n---\nBody\n";
-        let handle = fs
-            .create("/contacts/noorvir.md", 0o644, OpenOptions::from_raw(1))
-            .unwrap();
-        fs.write("/contacts/noorvir.md", handle, 0, text).unwrap();
-        fs.release("/contacts/noorvir.md", handle).unwrap();
+    #[test]
+    fn generic_sqlite_write_records_invalid_updates() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: \"\"\nemail: noorvir@example.com\nunknown: value\n---\nBody\n",
+        );
 
         let inner = fs.inner.lock().unwrap();
         let (first_name, email, content, invalid): (String, String, String, String) = inner
@@ -1053,5 +1125,167 @@ mod tests {
         assert_eq!(content, "Body\n");
         assert_eq!(invalid["first_name"]["attempted"], JsonValue::from(""));
         assert_eq!(invalid["unknown"]["attempted"], JsonValue::from("value"));
+    }
+
+    #[test]
+    fn text_columns_reject_unquoted_yaml_numbers() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: Noorvir\n---\nBody\n",
+        );
+        overwrite_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: 123\n---\nBody\n",
+        );
+
+        let inner = fs.inner.lock().unwrap();
+        let (first_name, invalid): (String, String) = inner
+            .conn
+            .query_row(
+                "SELECT first_name, _slfs_invalid_update FROM contacts WHERE _slfs_path = 'noorvir.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let invalid: JsonValue = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(first_name, "Noorvir");
+        assert_eq!(invalid["first_name"]["attempted"], JsonValue::from(123));
+        assert_eq!(
+            invalid["first_name"]["error"],
+            JsonValue::from("must be text")
+        );
+    }
+
+    #[test]
+    fn quoted_yaml_numbers_are_valid_text() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: \"123\"\n---\nBody\n",
+        );
+
+        let inner = fs.inner.lock().unwrap();
+        let (first_name, invalid): (String, String) = inner
+            .conn
+            .query_row(
+                "SELECT first_name, _slfs_invalid_update FROM contacts WHERE _slfs_path = 'noorvir.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let invalid: JsonValue = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(first_name, "123");
+        assert!(invalid.get("first_name").is_none());
+    }
+
+    #[test]
+    fn bare_null_and_empty_string_are_distinct_invalid_values() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: Noorvir\n---\nBody\n",
+        );
+        overwrite_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: \"\"\n---\nBody\n",
+        );
+        let empty_invalid: JsonValue = {
+            let inner = fs.inner.lock().unwrap();
+            serde_json::from_str(
+                &inner
+                    .conn
+                    .query_row(
+                        "SELECT _slfs_invalid_update FROM contacts WHERE _slfs_path = 'noorvir.md'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            empty_invalid["first_name"]["attempted"],
+            JsonValue::from("")
+        );
+        assert_eq!(
+            empty_invalid["first_name"]["error"],
+            JsonValue::from("constraint failed")
+        );
+
+        overwrite_doc(&fs, "/contacts/noorvir.md", "---\nfirst_name:\n---\nBody\n");
+        let null_invalid: JsonValue = {
+            let inner = fs.inner.lock().unwrap();
+            serde_json::from_str(
+                &inner
+                    .conn
+                    .query_row(
+                        "SELECT _slfs_invalid_update FROM contacts WHERE _slfs_path = 'noorvir.md'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(null_invalid["first_name"]["attempted"], JsonValue::Null);
+        assert_eq!(
+            null_invalid["first_name"]["error"],
+            JsonValue::from("cannot be null")
+        );
+    }
+
+    #[test]
+    fn nullable_text_columns_accept_bare_null() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: Noorvir\nemail: noorvir@example.com\n---\nBody\n",
+        );
+        overwrite_doc(&fs, "/contacts/noorvir.md", "---\nemail:\n---\nBody\n");
+
+        let inner = fs.inner.lock().unwrap();
+        let (email, invalid): (Option<String>, String) = inner
+            .conn
+            .query_row(
+                "SELECT email, _slfs_invalid_update FROM contacts WHERE _slfs_path = 'noorvir.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let invalid: JsonValue = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(email, None);
+        assert!(invalid.get("email").is_none());
+    }
+
+    #[test]
+    fn integer_columns_reject_quoted_yaml_numbers() {
+        let fs = test_fs(contact_schema());
+        create_doc(
+            &fs,
+            "/contacts/noorvir.md",
+            "---\nfirst_name: Noorvir\nage: 37\n---\nBody\n",
+        );
+        overwrite_doc(&fs, "/contacts/noorvir.md", "---\nage: \"38\"\n---\nBody\n");
+
+        let inner = fs.inner.lock().unwrap();
+        let (age, invalid): (i64, String) = inner
+            .conn
+            .query_row(
+                "SELECT age, _slfs_invalid_update FROM contacts WHERE _slfs_path = 'noorvir.md'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let invalid: JsonValue = serde_json::from_str(&invalid).unwrap();
+        assert_eq!(age, 37);
+        assert_eq!(invalid["age"]["attempted"], JsonValue::from("38"));
+        assert_eq!(invalid["age"]["error"], JsonValue::from("must be integer"));
     }
 }
