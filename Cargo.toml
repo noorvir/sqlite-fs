@@ -1,0 +1,17 @@
+[package]
+name = "sqlite-fs"
+version = "0.1.0"
+edition = "2024"
+default-run = "sqlite-fs"
+
+[workspace]
+members = [
+  ".",
+  "minfuse",
+  "minfs",
+]
+resolver = "3"
+
+[dependencies]
+minfuse = { path = "minfuse" }
+minfs = { path = "minfs" }
