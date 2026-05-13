@@ -3,7 +3,7 @@ use crate::schema::table_schema;
 use minfuse::FsError;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DocPath {
     table: String,
     file: String,

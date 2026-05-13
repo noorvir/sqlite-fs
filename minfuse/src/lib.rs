@@ -187,6 +187,18 @@ impl RenameFlags {
     pub fn is_empty(self) -> bool {
         self.raw == 0
     }
+
+    pub fn seclude(self) -> bool {
+        self.raw & 0x1 != 0
+    }
+
+    pub fn exchange(self) -> bool {
+        self.raw & 0x2 != 0
+    }
+
+    pub fn no_replace(self) -> bool {
+        self.raw & 0x4 != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1229,5 +1241,12 @@ mod tests {
         );
         assert!(OpenOptions::from_raw(libc::O_WRONLY | libc::O_TRUNC).writable());
         assert!(OpenOptions::from_raw(libc::O_WRONLY | libc::O_TRUNC).truncate());
+    }
+
+    #[test]
+    fn parses_macos_rename_flags() {
+        assert!(RenameFlags::from_raw(0x1).seclude());
+        assert!(RenameFlags::from_raw(0x2).exchange());
+        assert!(RenameFlags::from_raw(0x4).no_replace());
     }
 }

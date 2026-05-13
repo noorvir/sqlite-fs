@@ -21,12 +21,15 @@ use schema::{
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions as StdOpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct SqliteFs {
     backing: PathBuf,
@@ -37,6 +40,10 @@ struct Inner {
     conn: Connection,
     handles: HashMap<FileHandle, OpenFile>,
     next_handle: FileHandle,
+    // Typed rows do not carry POSIX timestamps. Keep stable attrs so editors do
+    // not see a file as externally modified on every getattr.
+    file_times: HashMap<DocPath, SystemTime>,
+    mount_time: SystemTime,
 }
 
 enum OpenFile {
@@ -54,6 +61,7 @@ struct TypedOpenFile {
 }
 
 struct PassOpenFile {
+    path: PathBuf,
     file: File,
     writable: bool,
 }
@@ -77,6 +85,8 @@ impl SqliteFs {
                 conn,
                 handles: HashMap::new(),
                 next_handle: 1,
+                file_times: HashMap::new(),
+                mount_time: SystemTime::now(),
             }),
         })
     }
@@ -101,6 +111,7 @@ impl SqliteFs {
         };
         if let Some((path, staged)) = typed_commit {
             commit_document(&mut inner.conn, &path, &staged)?;
+            mark_typed_modified(inner, &path);
             if let Some(OpenFile::Typed(open)) = inner.handles.get_mut(&handle) {
                 open.dirty = false;
             }
@@ -175,8 +186,8 @@ impl FileSystem for SqliteFs {
         self.try_rmdir(path).map_err(to_fs_error)
     }
 
-    fn rename(&self, from: &str, to: &str, _flags: RenameFlags) -> FsResult<()> {
-        self.try_rename(from, to).map_err(to_fs_error)
+    fn rename(&self, from: &str, to: &str, flags: RenameFlags) -> FsResult<()> {
+        self.try_rename(from, to, flags).map_err(to_fs_error)
     }
 
     fn chmod(&self, path: &str, handle: Option<FileHandle>, _mode: u32) -> FsResult<()> {
@@ -187,8 +198,8 @@ impl FileSystem for SqliteFs {
         self.try_metadata_noop(path, handle).map_err(to_fs_error)
     }
 
-    fn utimens(&self, path: &str, handle: Option<FileHandle>, _times: SetTimes) -> FsResult<()> {
-        self.try_metadata_noop(path, handle).map_err(to_fs_error)
+    fn utimens(&self, path: &str, handle: Option<FileHandle>, times: SetTimes) -> FsResult<()> {
+        self.try_utimens(path, handle, times).map_err(to_fs_error)
     }
 
     fn statfs(&self, _path: &str) -> FsResult<StatFs> {
@@ -208,7 +219,13 @@ impl SqliteFs {
 
     fn typed_attr(&self, inner: &Inner, doc: &DocPath) -> Result<Attr> {
         let rendered = render_document(&inner.conn, doc)?;
-        Ok(Attr::file(rendered.len() as u64))
+        let time = typed_time(inner, doc);
+        let mut attr = Attr::file(rendered.len() as u64);
+        attr.accessed = time;
+        attr.modified = time;
+        attr.changed = time;
+        attr.created = time;
+        Ok(attr)
     }
 
     fn try_readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
@@ -262,6 +279,7 @@ impl SqliteFs {
                 Ok(Self::alloc_handle(
                     &mut inner,
                     OpenFile::Pass(PassOpenFile {
+                        path,
                         file,
                         writable: options.writable(),
                     }),
@@ -295,6 +313,7 @@ impl SqliteFs {
                 Ok(Self::alloc_handle(
                     &mut inner,
                     OpenFile::Pass(PassOpenFile {
+                        path,
                         file,
                         writable: options.writable(),
                     }),
@@ -406,7 +425,9 @@ impl SqliteFs {
             Route::Typed(doc) => {
                 let mut staged = render_document(&inner.conn, &doc)?.into_bytes();
                 staged.resize(size_usize, 0);
-                commit_document(&mut inner.conn, &doc, &staged)
+                commit_document(&mut inner.conn, &doc, &staged)?;
+                mark_typed_modified(&mut inner, &doc);
+                Ok(())
             }
             Route::Pass(path) => {
                 let file = StdOpenOptions::new().write(true).open(path)?;
@@ -424,7 +445,9 @@ impl SqliteFs {
                 if document_exists(&inner.conn, &doc)? {
                     return Err(FsError::Exists.into());
                 }
-                commit_document(&mut inner.conn, &doc, b"")
+                commit_document(&mut inner.conn, &doc, b"")?;
+                mark_typed_modified(&mut inner, &doc);
+                Ok(())
             }
             Route::Pass(path) => {
                 ensure_virtual_parent(&inner.conn, &self.backing, path_to_str(&path)?)?;
@@ -452,13 +475,15 @@ impl SqliteFs {
     }
 
     fn try_unlink(&self, path: &str) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         match route(&inner.conn, &self.backing, path)? {
             Route::Typed(doc) => {
                 if has_open_typed_handle(&inner, &doc) {
                     return Err(FsError::PermissionDenied.into());
                 }
-                delete_typed(&inner.conn, &doc)
+                delete_typed(&inner.conn, &doc)?;
+                inner.file_times.remove(&doc);
+                Ok(())
             }
             Route::Pass(path) => {
                 fs::remove_file(path)?;
@@ -501,17 +526,67 @@ impl SqliteFs {
         }
     }
 
-    fn try_rename(&self, from: &str, to: &str) -> Result<()> {
+    fn try_utimens(&self, path: &str, handle: Option<FileHandle>, times: SetTimes) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if let Some(handle) = handle {
+            return match inner.handles.get(&handle) {
+                Some(OpenFile::Typed(open)) => {
+                    let doc = open.path.clone();
+                    let current = typed_time(&inner, &doc);
+                    let modified = times.modified.resolve(current);
+                    inner.file_times.insert(doc, modified);
+                    Ok(())
+                }
+                Some(OpenFile::Pass(open)) => set_file_times_fd(&open.file, times),
+                None => Err(FsError::BadFileDescriptor.into()),
+            };
+        }
+        match route(&inner.conn, &self.backing, path)? {
+            Route::Root | Route::TableDir(_) => Ok(()),
+            Route::Typed(doc) => {
+                if !document_exists(&inner.conn, &doc)? {
+                    return Err(FsError::NotFound.into());
+                }
+                let current = typed_time(&inner, &doc);
+                let modified = times.modified.resolve(current);
+                inner.file_times.insert(doc, modified);
+                Ok(())
+            }
+            Route::Pass(path) => set_file_times_path(&path, times),
+        }
+    }
+
+    fn try_rename(&self, from: &str, to: &str, flags: RenameFlags) -> Result<()> {
+        if flags.exchange() || flags.seclude() {
+            return Err(FsError::Unsupported.into());
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        // Renames are allowed to cross the overlay boundary. A typed path is a
+        // SQLite row; a passthrough path is a backing-file path.
         match (
             route(&inner.conn, &self.backing, from)?,
             route(&inner.conn, &self.backing, to)?,
         ) {
-            (Route::Typed(from), Route::Typed(to)) => rename_typed(&mut inner, from, to),
+            (Route::Typed(from), Route::Pass(to_path)) => {
+                move_typed_to_pass(&mut inner, from, to_path, flags.no_replace())
+            }
+            (Route::Typed(from), Route::Typed(to)) => {
+                rename_typed(&mut inner, from, to, flags.no_replace())
+            }
             (Route::Pass(from_path), Route::Pass(to_path)) => {
                 ensure_virtual_parent(&inner.conn, &self.backing, path_to_str(&to_path)?)?;
+                if flags.no_replace() && to_path.exists() {
+                    return Err(FsError::Exists.into());
+                }
                 fs::rename(from_path, to_path)?;
                 Ok(())
+            }
+            (Route::Pass(from_path), Route::Typed(to)) => {
+                if flags.no_replace() && document_exists(&inner.conn, &to)? {
+                    return Err(FsError::Exists.into());
+                }
+                rename_pass_to_typed(&mut inner, from_path, to)
             }
             _ => Err(FsError::Unsupported.into()),
         }
@@ -627,6 +702,55 @@ fn read_pass_file(file: &mut File, offset: u64, size: usize) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+fn set_file_times_fd(file: &File, times: SetTimes) -> Result<()> {
+    let times = [
+        time_to_timespec(times.accessed)?,
+        time_to_timespec(times.modified)?,
+    ];
+    let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+fn set_file_times_path(path: &Path, times: SetTimes) -> Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| FsError::InvalidInput)?;
+    let times = [
+        time_to_timespec(times.accessed)?,
+        time_to_timespec(times.modified)?,
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+fn time_to_timespec(time: minfuse::SetTime) -> Result<libc::timespec> {
+    match time {
+        minfuse::SetTime::Specific(time) => {
+            let duration = time
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| FsError::InvalidInput)?;
+            Ok(libc::timespec {
+                tv_sec: duration.as_secs() as libc::time_t,
+                tv_nsec: duration.subsec_nanos() as libc::c_long,
+            })
+        }
+        minfuse::SetTime::Now => Ok(libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW as libc::c_long,
+        }),
+        minfuse::SetTime::Omit => Ok(libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT as libc::c_long,
+        }),
+    }
+}
+
 fn delete_typed(conn: &Connection, doc: &DocPath) -> Result<()> {
     let schema = table_schema(conn, doc.table())?;
     let changed = conn.execute(
@@ -644,7 +768,82 @@ fn delete_typed(conn: &Connection, doc: &DocPath) -> Result<()> {
     }
 }
 
-fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath) -> Result<()> {
+fn move_typed_to_pass(
+    inner: &mut Inner,
+    from: DocPath,
+    to_path: PathBuf,
+    no_replace: bool,
+) -> Result<()> {
+    // Export the rendered document, then remove the row. This is a real rename,
+    // not a cache write; after success the typed path no longer exists.
+    if has_writable_open_typed_handle(inner, &from) {
+        return Err(FsError::PermissionDenied.into());
+    }
+    if no_replace && to_path.exists() {
+        return Err(FsError::Exists.into());
+    }
+    if !document_exists(&inner.conn, &from)? {
+        return Err(FsError::NotFound.into());
+    }
+    if let Some(parent) = to_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(to_path, render_document(&inner.conn, &from)?)?;
+    delete_typed(&inner.conn, &from)?;
+    inner.file_times.remove(&from);
+    Ok(())
+}
+
+fn typed_time(inner: &Inner, doc: &DocPath) -> SystemTime {
+    inner
+        .file_times
+        .get(doc)
+        .copied()
+        .unwrap_or(inner.mount_time)
+}
+
+fn mark_typed_modified(inner: &mut Inner, doc: &DocPath) {
+    inner.file_times.insert(doc.clone(), SystemTime::now());
+}
+
+fn rename_pass_to_typed(inner: &mut Inner, from_path: PathBuf, to: DocPath) -> Result<()> {
+    // Editors commonly rename an open temp file over the destination. Preserve
+    // fd semantics by converting matching passthrough handles to typed handles.
+    if has_writable_open_typed_handle(inner, &to) {
+        return Err(FsError::PermissionDenied.into());
+    }
+
+    for open in inner.handles.values_mut() {
+        if let OpenFile::Pass(open) = open
+            && open.path == from_path
+        {
+            open.file.sync_data()?;
+        }
+    }
+
+    let bytes = fs::read(&from_path)?;
+    commit_document(&mut inner.conn, &to, &bytes)?;
+    fs::remove_file(&from_path)?;
+
+    for open in inner.handles.values_mut() {
+        if let OpenFile::Pass(pass) = open
+            && pass.path == from_path
+        {
+            *open = OpenFile::Typed(TypedOpenFile {
+                path: to.clone(),
+                staged: bytes.clone(),
+                dirty: false,
+                writable: pass.writable,
+                append: false,
+            });
+        }
+    }
+
+    mark_typed_modified(inner, &to);
+    Ok(())
+}
+
+fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath, no_replace: bool) -> Result<()> {
     if from.table() != to.table() {
         return Err(FsError::Unsupported.into());
     }
@@ -664,14 +863,19 @@ fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath) -> Result<()> {
     if !row_exists(&tx, &schema, from.file())? {
         return Err(FsError::NotFound.into());
     }
-    tx.execute(
-        &format!(
-            "DELETE FROM {} WHERE {} = ?1",
-            quote_ident(schema.name()),
-            quote_ident("_slfs_path")
-        ),
-        params![to.file()],
-    )?;
+    if no_replace && row_exists(&tx, &schema, to.file())? {
+        return Err(FsError::Exists.into());
+    }
+    if !no_replace {
+        tx.execute(
+            &format!(
+                "DELETE FROM {} WHERE {} = ?1",
+                quote_ident(schema.name()),
+                quote_ident("_slfs_path")
+            ),
+            params![to.file()],
+        )?;
+    }
     tx.execute(
         &format!(
             "UPDATE {} SET {} = ?1 WHERE {} = ?2",
@@ -682,12 +886,21 @@ fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath) -> Result<()> {
         params![to.file(), from.file()],
     )?;
     tx.commit()?;
+    inner.file_times.remove(&from);
+    mark_typed_modified(inner, &to);
     Ok(())
 }
 
 fn has_open_typed_handle(inner: &Inner, doc: &DocPath) -> bool {
     inner.handles.values().any(|open| match open {
         OpenFile::Typed(open) => &open.path == doc,
+        OpenFile::Pass(_) => false,
+    })
+}
+
+fn has_writable_open_typed_handle(inner: &Inner, doc: &DocPath) -> bool {
+    inner.handles.values().any(|open| match open {
+        OpenFile::Typed(open) => &open.path == doc && open.writable,
         OpenFile::Pass(_) => false,
     })
 }
@@ -1061,6 +1274,8 @@ mod tests {
                 conn,
                 handles: HashMap::new(),
                 next_handle: 1,
+                file_times: HashMap::new(),
+                mount_time: SystemTime::now(),
             }),
         }
     }
@@ -1410,6 +1625,74 @@ mod tests {
         assert_eq!(
             fs.read("/docs/existing.md", NO_HANDLE, 0, 100).unwrap(),
             b"keep"
+        );
+    }
+
+    #[test]
+    fn passthrough_temp_file_can_replace_typed_document() {
+        let fs = test_fs(docs_schema());
+        create_doc(&fs, "/docs/note.md", "old");
+
+        let handle = fs
+            .create(
+                "/docs/.note.md.tmp",
+                0o644,
+                OpenOptions::from_raw(O_WRONLY_RAW),
+            )
+            .unwrap();
+        fs.write("/docs/.note.md.tmp", handle, 0, b"new").unwrap();
+        fs.release("/docs/.note.md.tmp", handle).unwrap();
+
+        fs.rename(
+            "/docs/.note.md.tmp",
+            "/docs/note.md",
+            RenameFlags::from_raw(0),
+        )
+        .unwrap();
+
+        assert_eq!(fs.read("/docs/note.md", NO_HANDLE, 0, 100).unwrap(), b"new");
+        assert!(matches!(
+            fs.getattr("/docs/.note.md.tmp"),
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn pass_to_typed_rename_hands_open_source_handle_to_typed_document() {
+        let fs = test_fs(docs_schema());
+        create_doc(&fs, "/docs/note.md", "old");
+        fs.rename(
+            "/docs/note.md",
+            "/docs/note.md.sb-test",
+            RenameFlags::from_raw(0),
+        )
+        .unwrap();
+
+        let handle = fs
+            .create(
+                "/docs/.note.md.tmp",
+                0o644,
+                OpenOptions::from_raw(O_WRONLY_RAW),
+            )
+            .unwrap();
+        fs.write("/docs/.note.md.tmp", handle, 0, b"first").unwrap();
+
+        fs.rename(
+            "/docs/.note.md.tmp",
+            "/docs/note.md",
+            RenameFlags::from_raw(0),
+        )
+        .unwrap();
+
+        fs.write("/docs/note.md", handle, 5, b"second").unwrap();
+        fs.release("/docs/note.md", handle).unwrap();
+        assert!(matches!(
+            fs.getattr("/docs/.note.md.tmp"),
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(
+            fs.read("/docs/note.md", NO_HANDLE, 0, 100).unwrap(),
+            b"firstsecond"
         );
     }
 

@@ -22,6 +22,8 @@ fi
 
 if is_mounted; then
   echo "Already mounted: $MP"
+  echo "Stop it with: scripts/stop.sh"
+  echo "Fresh restart: scripts/restart.sh"
   exit 0
 fi
 
@@ -78,7 +80,9 @@ for _ in {1..80}; do
     echo "  sqlite3 '$DB' 'SELECT _slfs_path, first_name, email, _slfs_content, _slfs_invalid_update FROM contacts;'"
     echo
     echo "Stop:"
-    echo "  kill $(cat "$PID")"
+    echo "  scripts/stop.sh"
+    echo "Fresh restart:"
+    echo "  scripts/restart.sh"
     exit 0
   fi
   sleep 0.25
