@@ -20,9 +20,11 @@ A table is exposed as a folder when it has:
 
 ```sql
 _slfs_path TEXT UNIQUE NOT NULL,
-_slfs_content TEXT NOT NULL DEFAULT '',
-_slfs_invalid_update TEXT NOT NULL DEFAULT '{}'
+_slfs_content TEXT NOT NULL,
+_slfs_invalid_update TEXT NOT NULL
 ```
+
+`_slfs_path` must be globally unique; partial unique indexes do not qualify. Defaults for `_slfs_content` and `_slfs_invalid_update` are optional because sqlite-fs writes both internal values explicitly when it creates a row.
 
 The folder name is the table name. `_slfs_path` is the filename inside it.
 
@@ -95,18 +97,11 @@ else: store attempted value in _slfs_invalid_update
 COMMIT
 ```
 
-If a constraint is still hit unexpectedly, use a savepoint around the risky update:
+If a single-column constraint is still hit unexpectedly, use a savepoint around that update and write the attempted value to `_slfs_invalid_update`.
 
-```txt
-SAVEPOINT apply_field
-try canonical update
-on SQLITE_CONSTRAINT:
-  ROLLBACK TO apply_field
-  write attempted value to _slfs_invalid_update
-RELEASE apply_field
-```
+For multiple canonical columns, apply the candidate as one row update. If that grouped update hits a DB-backed semantic constraint that cannot be attributed safely, roll back the grouped update, leave canonical columns unchanged, and record the attempted fields in `_slfs_invalid_update` conservatively.
 
-The goal is to convert semantic conflicts into `_slfs_invalid_update`, not fail the whole write.
+The goal is to convert semantic conflicts into `_slfs_invalid_update`, not fail the whole write or apply fields through invalid intermediate rows.
 
 ## New rows
 

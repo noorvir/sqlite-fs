@@ -564,13 +564,21 @@ fn state<'a>(user_data: *mut c_void) -> &'a MountState {
     unsafe { &*(user_data as *const MountState) }
 }
 
-fn path(path: *const c_char) -> FsResult<String> {
-    if path.is_null() {
+fn c_string(ptr: *const c_char) -> FsResult<String> {
+    if ptr.is_null() {
         return Err(FsError::InvalidInput);
     }
-    Ok(unsafe { CStr::from_ptr(path) }
+    Ok(unsafe { CStr::from_ptr(ptr) }
         .to_string_lossy()
         .into_owned())
+}
+
+fn path(path: *const c_char) -> FsResult<String> {
+    c_string(path)
+}
+
+fn xattr_name(name: *const c_char) -> FsResult<String> {
+    c_string(name)
 }
 
 fn optional_handle(has_handle: c_int, handle: FileHandle) -> Option<FileHandle> {
@@ -618,7 +626,7 @@ extern "C" fn cb_getattr(
     catch(|| {
         to_rc((|| {
             let attr = state(user_data).fs.getattr(&path(path_ptr)?)?;
-            fill_stat(st, &attr);
+            fill_stat(st, &attr)?;
             Ok(0)
         })())
     })
@@ -825,6 +833,9 @@ extern "C" fn cb_open(
 ) -> c_int {
     catch(|| {
         to_rc((|| {
+            if out_handle.is_null() {
+                return Err(FsError::InvalidInput);
+            }
             let handle = state(user_data)
                 .fs
                 .open(&path(path_ptr)?, OpenOptions::from_raw(flags))?;
@@ -843,6 +854,9 @@ extern "C" fn cb_create(
 ) -> c_int {
     catch(|| {
         to_rc((|| {
+            if out_handle.is_null() {
+                return Err(FsError::InvalidInput);
+            }
             let handle = state(user_data).fs.create(
                 &path(path_ptr)?,
                 mode.into(),
@@ -869,7 +883,12 @@ extern "C" fn cb_read(
                 .fs
                 .read(&path(path_ptr)?, handle, offset, size)?;
             let len = data.len().min(size);
-            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, len) };
+            if len != 0 {
+                if out.is_null() {
+                    return Err(FsError::InvalidInput);
+                }
+                unsafe { ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, len) };
+            }
             to_count(len)
         })())
     })
@@ -886,7 +905,13 @@ extern "C" fn cb_write(
     catch(|| {
         to_rc((|| {
             let offset = u64::try_from(off).map_err(|_| FsError::InvalidInput)?;
-            let input = unsafe { std::slice::from_raw_parts(input as *const u8, size) };
+            let input = if size == 0 {
+                &[][..]
+            } else if input.is_null() {
+                return Err(FsError::InvalidInput);
+            } else {
+                unsafe { std::slice::from_raw_parts(input as *const u8, size) }
+            };
             let written = state(user_data)
                 .fs
                 .write(&path(path_ptr)?, handle, offset, input)?;
@@ -903,7 +928,7 @@ extern "C" fn cb_statfs(
     catch(|| {
         to_rc((|| {
             let stat = state(user_data).fs.statfs(&path(path_ptr)?)?;
-            fill_statvfs(st, &stat);
+            fill_statvfs(st, &stat)?;
             Ok(0)
         })())
     })
@@ -970,7 +995,7 @@ extern "C" fn cb_setxattr(
             };
             state(user_data)
                 .fs
-                .setxattr(&path(path_ptr)?, &path(name_ptr)?, value, flags)?;
+                .setxattr(&path(path_ptr)?, &xattr_name(name_ptr)?, value, flags)?;
             Ok(0)
         })())
     })
@@ -987,7 +1012,7 @@ extern "C" fn cb_getxattr(
         to_rc((|| {
             let value = state(user_data)
                 .fs
-                .getxattr(&path(path_ptr)?, &path(name_ptr)?)?;
+                .getxattr(&path(path_ptr)?, &xattr_name(name_ptr)?)?;
             copy_sized_result(&value, out, size)
         })())
     })
@@ -1021,7 +1046,7 @@ extern "C" fn cb_removexattr(
         to_rc((|| {
             state(user_data)
                 .fs
-                .removexattr(&path(path_ptr)?, &path(name_ptr)?)?;
+                .removexattr(&path(path_ptr)?, &xattr_name(name_ptr)?)?;
             Ok(0)
         })())
     })
@@ -1035,6 +1060,9 @@ extern "C" fn cb_opendir(
 ) -> c_int {
     catch(|| {
         to_rc((|| {
+            if out_handle.is_null() {
+                return Err(FsError::InvalidInput);
+            }
             let handle = state(user_data)
                 .fs
                 .opendir(&path(path_ptr)?, OpenOptions::from_raw(flags))?;
@@ -1115,7 +1143,10 @@ fn fill_dir(buf: *mut c_void, filler: FuseFillDir, name: &str) -> FsResult<()> {
     if full { Err(FsError::Io) } else { Ok(()) }
 }
 
-fn fill_stat(st: *mut libc::stat, attr: &Attr) {
+fn fill_stat(st: *mut libc::stat, attr: &Attr) -> FsResult<()> {
+    if st.is_null() {
+        return Err(FsError::InvalidInput);
+    }
     unsafe { ptr::write_bytes(st, 0, 1) };
     unsafe {
         (*st).st_uid = attr.uid;
@@ -1140,9 +1171,13 @@ fn fill_stat(st: *mut libc::stat, attr: &Attr) {
         (*st).st_size = attr.len as i64;
         (*st).st_blocks = attr.len.div_ceil(512) as i64;
     }
+    Ok(())
 }
 
-fn fill_statvfs(st: *mut libc::statvfs, stat: &StatFs) {
+fn fill_statvfs(st: *mut libc::statvfs, stat: &StatFs) -> FsResult<()> {
+    if st.is_null() {
+        return Err(FsError::InvalidInput);
+    }
     unsafe { ptr::write_bytes(st, 0, 1) };
     unsafe {
         (*st).f_bsize = stat.block_size as _;
@@ -1155,6 +1190,7 @@ fn fill_statvfs(st: *mut libc::statvfs, stat: &StatFs) {
         (*st).f_favail = stat.files_free as _;
         (*st).f_namemax = stat.name_max as _;
     }
+    Ok(())
 }
 
 fn seconds(time: SystemTime) -> i64 {

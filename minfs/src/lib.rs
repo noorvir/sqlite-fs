@@ -158,10 +158,10 @@ impl FileSystem for MinFs {
 
         let mut entries = BTreeMap::new();
         for dir in inner.dirs.keys() {
-            if dir != "/" {
-                if let Some(name) = child_name(&path, dir) {
-                    entries.insert(name, EntryKind::Directory);
-                }
+            if dir != "/"
+                && let Some(name) = child_name(&path, dir)
+            {
+                entries.insert(name, EntryKind::Directory);
             }
         }
         for file in inner.files.keys() {
@@ -299,6 +299,9 @@ impl FileSystem for MinFs {
 
         if let Some(handle) = handle {
             if let Some(open) = inner.handles.get_mut(&handle) {
+                if !open.writable {
+                    return Err(FsError::BadFileDescriptor);
+                }
                 open.staged.resize(size, 0);
                 open.dirty = true;
                 return Ok(());
@@ -562,10 +565,10 @@ fn normalize(path: &str) -> FsResult<String> {
     if path.len() > 4096 {
         return Err(FsError::NameTooLong);
     }
-    if let Some(name) = path.rsplit('/').next() {
-        if name.len() > MAX_NAME_LEN {
-            return Err(FsError::NameTooLong);
-        }
+    if let Some(name) = path.rsplit('/').next()
+        && name.len() > MAX_NAME_LEN
+    {
+        return Err(FsError::NameTooLong);
     }
     Ok(path)
 }
