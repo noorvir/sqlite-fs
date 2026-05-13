@@ -1,20 +1,32 @@
+mod document;
+mod error;
+mod route;
+mod schema;
+
+pub use error::Error;
+
+use document::{invalid_entry, parse_markdown, render_document};
+use error::{Result, is_semantic_sql_error, to_fs_error};
 use minfuse::{
     Attr, DirEntry, EntryKind, FileHandle, FileSystem, FsError, FsResult, NO_HANDLE, OpenOptions,
     RenameFlags, SetTimes, StatFs,
 };
+use route::{DocPath, Route, is_typed_file_name, path_to_str, route};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+#[cfg(test)]
+use schema::short_suffix;
+use schema::{
+    Column, TableSchema, eligible_tables, generic_default, json_to_sql, quote_ident, table_schema,
+};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions as StdOpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-
-static PLACEHOLDER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct SqliteFs {
     backing: PathBuf,
@@ -45,39 +57,6 @@ struct PassOpenFile {
     file: File,
     writable: bool,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DocPath {
-    table: String,
-    file: String,
-}
-
-#[derive(Debug, Clone)]
-struct TableSchema {
-    name: String,
-    columns: Vec<Column>,
-}
-
-#[derive(Debug, Clone)]
-struct Column {
-    name: String,
-    decl_type: String,
-    not_null: bool,
-    default_value: Option<String>,
-    pk: bool,
-}
-
-#[derive(Debug)]
-pub enum Error {
-    Fs(FsError),
-    Sql(rusqlite::Error),
-    Json(serde_json::Error),
-    Yaml(serde_yaml::Error),
-    Utf8(std::str::Utf8Error),
-    Io(std::io::Error),
-}
-
-type Result<T> = std::result::Result<T, Error>;
 
 impl SqliteFs {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -543,64 +522,6 @@ fn default_backing_path(db: &Path) -> PathBuf {
     PathBuf::from(format!("{}.files", db.display()))
 }
 
-#[derive(Debug)]
-enum Route {
-    Root,
-    TableDir(String),
-    Typed(DocPath),
-    Pass(PathBuf),
-}
-
-fn route(conn: &Connection, backing: &Path, path: &str) -> Result<Route> {
-    if path == "/" {
-        return Ok(Route::Root);
-    }
-    let parts = path_components(path)?;
-    let typed_table = match parts.as_slice() {
-        [table] => table_schema(conn, table).is_ok(),
-        [table, file] if is_typed_file_name(file) => table_schema(conn, table).is_ok(),
-        _ => false,
-    };
-    if parts.len() == 1 && typed_table {
-        return Ok(Route::TableDir(parts[0].clone()));
-    }
-    if parts.len() == 2 && typed_table {
-        return Ok(Route::Typed(DocPath {
-            table: parts[0].clone(),
-            file: parts[1].clone(),
-        }));
-    }
-    Ok(Route::Pass(backing.join(parts.iter().collect::<PathBuf>())))
-}
-
-fn path_components(path: &str) -> Result<Vec<String>> {
-    let trimmed = path.strip_prefix('/').ok_or(FsError::InvalidInput)?;
-    if trimmed.is_empty() || trimmed.contains('\0') {
-        return Err(FsError::InvalidInput.into());
-    }
-    let mut parts = Vec::new();
-    for part in trimmed.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            return Err(FsError::InvalidInput.into());
-        }
-        parts.push(part.to_string());
-    }
-    Ok(parts)
-}
-
-fn is_typed_file_name(name: &str) -> bool {
-    name.ends_with(".md")
-        && !name.starts_with("._")
-        && name != ".DS_Store"
-        && !name.contains('/')
-        && !name.contains('\0')
-        && name.len() <= 255
-}
-
-fn path_to_str(path: &Path) -> Result<&str> {
-    path.to_str().ok_or(FsError::InvalidInput.into())
-}
-
 fn ensure_virtual_parent(conn: &Connection, backing: &Path, path: &str) -> Result<()> {
     let relative = Path::new(path)
         .strip_prefix(backing)
@@ -664,7 +585,7 @@ fn typed_files(inner: &Inner, table: &str) -> Result<BTreeSet<String>> {
     let mut stmt = inner.conn.prepare(&format!(
         "SELECT {} FROM {} ORDER BY {}",
         quote_ident("_slfs_path"),
-        quote_ident(&schema.name),
+        quote_ident(schema.name()),
         quote_ident("_slfs_path")
     ))?;
     let rows = stmt
@@ -707,14 +628,14 @@ fn read_pass_file(file: &mut File, offset: u64, size: usize) -> Result<Vec<u8>> 
 }
 
 fn delete_typed(conn: &Connection, doc: &DocPath) -> Result<()> {
-    let schema = table_schema(conn, &doc.table)?;
+    let schema = table_schema(conn, doc.table())?;
     let changed = conn.execute(
         &format!(
             "DELETE FROM {} WHERE {} = ?1",
-            quote_ident(&schema.name),
+            quote_ident(schema.name()),
             quote_ident("_slfs_path")
         ),
-        params![doc.file],
+        params![doc.file()],
     )?;
     if changed == 0 {
         Err(FsError::NotFound.into())
@@ -724,10 +645,10 @@ fn delete_typed(conn: &Connection, doc: &DocPath) -> Result<()> {
 }
 
 fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath) -> Result<()> {
-    if from.table != to.table {
+    if from.table() != to.table() {
         return Err(FsError::Unsupported.into());
     }
-    if from.file == to.file {
+    if from.file() == to.file() {
         return if document_exists(&inner.conn, &from)? {
             Ok(())
         } else {
@@ -738,27 +659,27 @@ fn rename_typed(inner: &mut Inner, from: DocPath, to: DocPath) -> Result<()> {
         return Err(FsError::PermissionDenied.into());
     }
 
-    let schema = table_schema(&inner.conn, &from.table)?;
+    let schema = table_schema(&inner.conn, from.table())?;
     let tx = inner.conn.transaction()?;
-    if !row_exists(&tx, &schema, &from.file)? {
+    if !row_exists(&tx, &schema, from.file())? {
         return Err(FsError::NotFound.into());
     }
     tx.execute(
         &format!(
             "DELETE FROM {} WHERE {} = ?1",
-            quote_ident(&schema.name),
+            quote_ident(schema.name()),
             quote_ident("_slfs_path")
         ),
-        params![to.file],
+        params![to.file()],
     )?;
     tx.execute(
         &format!(
             "UPDATE {} SET {} = ?1 WHERE {} = ?2",
-            quote_ident(&schema.name),
+            quote_ident(schema.name()),
             quote_ident("_slfs_path"),
             quote_ident("_slfs_path")
         ),
-        params![to.file, from.file],
+        params![to.file(), from.file()],
     )?;
     tx.commit()?;
     Ok(())
@@ -774,12 +695,12 @@ fn has_open_typed_handle(inner: &Inner, doc: &DocPath) -> bool {
 fn commit_document(conn: &mut Connection, doc: &DocPath, bytes: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(bytes)?;
     let (props, body) = parse_markdown(text)?;
-    let schema = table_schema(conn, &doc.table)?;
+    let schema = table_schema(conn, doc.table())?;
     let tx = conn.transaction()?;
 
-    let existed = row_exists(&tx, &schema, &doc.file)?;
+    let existed = row_exists(&tx, &schema, doc.file())?;
     let mut invalid = if existed {
-        let mut invalid = load_invalid_update(&tx, &schema, &doc.file)?;
+        let mut invalid = load_invalid_update(&tx, &schema, doc.file())?;
         invalid.retain(|key, _| props.contains_key(key));
         invalid
     } else {
@@ -807,32 +728,33 @@ fn commit_document(conn: &mut Connection, doc: &DocPath, bytes: &[u8]) -> Result
         tx.execute(
             &format!(
                 "UPDATE {} SET {} = ?1 WHERE {} = ?2",
-                quote_ident(&schema.name),
+                quote_ident(schema.name()),
                 quote_ident("_slfs_content"),
                 quote_ident("_slfs_path")
             ),
-            params![body, doc.file],
+            params![body, doc.file()],
         )?;
-        apply_property_updates(&tx, &schema, &doc.file, &updates, &mut invalid)?;
+        apply_property_updates(&tx, &schema, doc.file(), &updates, &mut invalid)?;
     } else {
-        let consumed = insert_document_row(&tx, &schema, &doc.file, &body, &updates, &mut invalid)?;
+        let consumed =
+            insert_document_row(&tx, &schema, doc.file(), &body, &updates, &mut invalid)?;
         let remaining = updates
             .iter()
-            .filter(|(column, _)| !consumed.contains(&column.name))
+            .filter(|(column, _)| !consumed.contains(column.name()))
             .map(|(column, value)| (*column, value.clone()))
             .collect::<Vec<_>>();
-        apply_property_updates(&tx, &schema, &doc.file, &remaining, &mut invalid)?;
+        apply_property_updates(&tx, &schema, doc.file(), &remaining, &mut invalid)?;
     }
 
     let invalid_json = serde_json::to_string(&invalid)?;
     tx.execute(
         &format!(
             "UPDATE {} SET {} = ?1 WHERE {} = ?2",
-            quote_ident(&schema.name),
+            quote_ident(schema.name()),
             quote_ident("_slfs_invalid_update"),
             quote_ident("_slfs_path")
         ),
-        params![invalid_json, doc.file],
+        params![invalid_json, doc.file()],
     )?;
     tx.commit()?;
     Ok(())
@@ -853,7 +775,7 @@ fn insert_document_row(
         .collect::<Vec<_>>();
     let consumed = supplied_required
         .iter()
-        .map(|(column, _)| column.name.clone())
+        .map(|(column, _)| column.name().to_string())
         .collect::<BTreeSet<_>>();
 
     match try_insert_document_row(tx, schema, file, body, &supplied_required, invalid) {
@@ -887,16 +809,16 @@ fn try_insert_document_row(
     ];
 
     for (column, value) in supplied_required {
-        columns.push(column.name.clone());
+        columns.push(column.name().to_string());
         values.push(json_to_sql(value));
     }
 
     for column in schema.domain_columns() {
         let already_supplied = supplied_required
             .iter()
-            .any(|(supplied, _)| supplied.name == column.name);
+            .any(|(supplied, _)| supplied.name() == column.name());
         if !already_supplied && column.needs_insert_value() {
-            columns.push(column.name.clone());
+            columns.push(column.name().to_string());
             values.push(generic_default(column));
         }
     }
@@ -913,7 +835,7 @@ fn try_insert_document_row(
     tx.execute(
         &format!(
             "INSERT INTO {} ({}) VALUES ({})",
-            quote_ident(&schema.name),
+            quote_ident(schema.name()),
             quoted_columns,
             placeholders
         ),
@@ -933,12 +855,12 @@ fn apply_property_updates(
         [] => Ok(()),
         [(column, value)] => match try_update_field(tx, schema, column, file, value) {
             Ok(()) => {
-                invalid.remove(&column.name);
+                invalid.remove(column.name());
                 Ok(())
             }
             Err(err) if is_semantic_sql_error(&err) => {
                 invalid.insert(
-                    column.name.clone(),
+                    column.name().to_string(),
                     invalid_entry(value.clone(), "constraint failed"),
                 );
                 Ok(())
@@ -964,7 +886,7 @@ fn remove_invalid_entries(
     updates: &[(&Column, JsonValue)],
 ) {
     for (column, _) in updates {
-        invalid.remove(&column.name);
+        invalid.remove(column.name());
     }
 }
 
@@ -974,7 +896,7 @@ fn mark_constraint_failed(
 ) {
     for (column, value) in updates {
         invalid.insert(
-            column.name.clone(),
+            column.name().to_string(),
             invalid_entry(value.clone(), "constraint failed"),
         );
     }
@@ -1012,7 +934,7 @@ fn try_update_fields(
     let assignments = updates
         .iter()
         .enumerate()
-        .map(|(index, (column, _))| format!("{} = ?{}", quote_ident(&column.name), index + 1))
+        .map(|(index, (column, _))| format!("{} = ?{}", quote_ident(column.name()), index + 1))
         .collect::<Vec<_>>()
         .join(", ");
     let where_param = updates.len() + 1;
@@ -1026,7 +948,7 @@ fn try_update_fields(
         tx.execute(
             &format!(
                 "UPDATE {} SET {} WHERE {} = ?{}",
-                quote_ident(&schema.name),
+                quote_ident(schema.name()),
                 assignments,
                 quote_ident("_slfs_path"),
                 where_param,
@@ -1049,8 +971,8 @@ fn try_update_field(
         tx.execute(
             &format!(
                 "UPDATE {} SET {} = ?1 WHERE {} = ?2",
-                quote_ident(&schema.name),
-                quote_ident(&column.name),
+                quote_ident(schema.name()),
+                quote_ident(column.name()),
                 quote_ident("_slfs_path")
             ),
             params![json_to_sql(value), file],
@@ -1058,77 +980,6 @@ fn try_update_field(
         .map(|_| ())
         .map_err(Into::into)
     })
-}
-
-fn render_document(conn: &Connection, doc: &DocPath) -> Result<String> {
-    let schema = table_schema(conn, &doc.table)?;
-    let row = load_row(conn, &schema, &doc.file)?.ok_or(FsError::NotFound)?;
-    let mut props = JsonMap::new();
-    for column in schema.domain_columns() {
-        if let Some(value) = row.values.get(&column.name) {
-            props.insert(column.name.clone(), sql_to_json(value));
-        }
-    }
-    for (key, value) in row.invalid {
-        if let Some(attempted) = value.get("attempted") {
-            props.insert(key, attempted.clone());
-        }
-    }
-
-    let mut out = String::new();
-    if !props.is_empty() {
-        out.push_str("---\n");
-        out.push_str(&serde_yaml::to_string(&props)?);
-        out.push_str("---\n");
-    }
-    out.push_str(&row.content);
-    Ok(out)
-}
-
-struct LoadedRow {
-    values: HashMap<String, SqlValue>,
-    invalid: JsonMap<String, JsonValue>,
-    content: String,
-}
-
-fn load_row(conn: &Connection, schema: &TableSchema, file: &str) -> Result<Option<LoadedRow>> {
-    let selected = schema
-        .columns
-        .iter()
-        .map(|column| quote_ident(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT {} FROM {} WHERE {} = ?1",
-        selected,
-        quote_ident(&schema.name),
-        quote_ident("_slfs_path")
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    stmt.query_row(params![file], |row| {
-        let mut values = HashMap::new();
-        for (index, column) in schema.columns.iter().enumerate() {
-            values.insert(column.name.clone(), row.get::<_, SqlValue>(index)?);
-        }
-        let content = match values.get("_slfs_content") {
-            Some(SqlValue::Text(text)) => text.clone(),
-            _ => String::new(),
-        };
-        let invalid = match values.get("_slfs_invalid_update") {
-            Some(SqlValue::Text(text)) => serde_json::from_str::<JsonValue>(text)
-                .ok()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default(),
-            _ => JsonMap::new(),
-        };
-        Ok(LoadedRow {
-            values,
-            invalid,
-            content,
-        })
-    })
-    .optional()
-    .map_err(Into::into)
 }
 
 fn load_invalid_update(
@@ -1141,7 +992,7 @@ fn load_invalid_update(
             &format!(
                 "SELECT {} FROM {} WHERE {} = ?1",
                 quote_ident("_slfs_invalid_update"),
-                quote_ident(&schema.name),
+                quote_ident(schema.name()),
                 quote_ident("_slfs_path")
             ),
             params![file],
@@ -1159,7 +1010,7 @@ fn row_exists(tx: &Transaction<'_>, schema: &TableSchema, file: &str) -> Result<
         .query_row(
             &format!(
                 "SELECT 1 FROM {} WHERE {} = ?1",
-                quote_ident(&schema.name),
+                quote_ident(schema.name()),
                 quote_ident("_slfs_path")
             ),
             params![file],
@@ -1170,205 +1021,19 @@ fn row_exists(tx: &Transaction<'_>, schema: &TableSchema, file: &str) -> Result<
 }
 
 fn document_exists(conn: &Connection, doc: &DocPath) -> Result<bool> {
-    let schema = table_schema(conn, &doc.table)?;
+    let schema = table_schema(conn, doc.table())?;
     let exists: Option<i64> = conn
         .query_row(
             &format!(
                 "SELECT 1 FROM {} WHERE {} = ?1",
-                quote_ident(&schema.name),
+                quote_ident(schema.name()),
                 quote_ident("_slfs_path")
             ),
-            params![doc.file],
+            params![doc.file()],
             |row| row.get(0),
         )
         .optional()?;
     Ok(exists.is_some())
-}
-
-fn eligible_tables(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_schema \
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
-         ORDER BY name",
-    )?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(names
-        .into_iter()
-        .filter_map(|name| table_schema(conn, &name).ok().map(|_| name))
-        .collect())
-}
-
-fn table_schema(conn: &Connection, table: &str) -> Result<TableSchema> {
-    validate_ident(table)?;
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(table)))?;
-    let columns = stmt
-        .query_map([], |row| {
-            Ok(Column {
-                name: row.get(1)?,
-                decl_type: row.get::<_, String>(2)?,
-                not_null: row.get::<_, i64>(3)? != 0,
-                default_value: row.get(4)?,
-                pk: row.get::<_, i64>(5)? != 0,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let schema = TableSchema {
-        name: table.to_string(),
-        columns,
-    };
-    if schema.has_required_columns() && path_is_unique(conn, &schema.name)? {
-        Ok(schema)
-    } else {
-        Err(FsError::NotFound.into())
-    }
-}
-
-fn path_is_unique(conn: &Connection, table: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA index_list({})", quote_ident(table)))?;
-    let indexes = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? != 0,
-                row.get::<_, i64>(4)? != 0,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    for (index, unique, partial) in indexes {
-        if !unique || partial {
-            continue;
-        }
-        let mut stmt = conn.prepare(&format!("PRAGMA index_info({})", quote_ident(&index)))?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, Option<String>>(2))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if columns.len() == 1 && columns[0].as_deref() == Some("_slfs_path") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-impl TableSchema {
-    fn has_required_columns(&self) -> bool {
-        let Some(path) = self.column("_slfs_path") else {
-            return false;
-        };
-        let Some(content) = self.column("_slfs_content") else {
-            return false;
-        };
-        let Some(invalid_update) = self.column("_slfs_invalid_update") else {
-            return false;
-        };
-
-        path.is_required_text() && content.is_required_text() && invalid_update.is_required_text()
-    }
-
-    fn column(&self, name: &str) -> Option<&Column> {
-        self.columns.iter().find(|column| column.name == name)
-    }
-
-    fn domain_columns(&self) -> Vec<&Column> {
-        self.columns
-            .iter()
-            .filter(|column| !column.name.starts_with("_slfs_"))
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnAffinity {
-    Text,
-    Integer,
-    Real,
-    Numeric,
-    Blob,
-}
-
-impl Column {
-    fn needs_insert_value(&self) -> bool {
-        (self.not_null || (self.pk && self.affinity() != ColumnAffinity::Integer))
-            && self.default_value.is_none()
-    }
-
-    fn is_required_text(&self) -> bool {
-        self.affinity() == ColumnAffinity::Text && self.not_null
-    }
-
-    fn affinity(&self) -> ColumnAffinity {
-        let ty = self.decl_type.to_ascii_uppercase();
-        if ty.contains("INT") {
-            ColumnAffinity::Integer
-        } else if ty.contains("CHAR") || ty.contains("CLOB") || ty.contains("TEXT") {
-            ColumnAffinity::Text
-        } else if ty.contains("REAL") || ty.contains("FLOA") || ty.contains("DOUB") {
-            ColumnAffinity::Real
-        } else if ty.contains("BLOB") || ty.is_empty() {
-            ColumnAffinity::Blob
-        } else {
-            ColumnAffinity::Numeric
-        }
-    }
-
-    fn property_type_error(&self, value: &JsonValue) -> Option<&'static str> {
-        if value.is_null() {
-            return self.not_null.then_some("cannot be null");
-        }
-        match self.affinity() {
-            ColumnAffinity::Text => value.as_str().is_none().then_some("must be text"),
-            ColumnAffinity::Integer => (!is_json_integer(value)).then_some("must be integer"),
-            ColumnAffinity::Real => (!value.is_number()).then_some("must be number"),
-            ColumnAffinity::Numeric => value
-                .is_array()
-                .then_some("must be scalar")
-                .or_else(|| value.is_object().then_some("must be scalar")),
-            ColumnAffinity::Blob => Some("blob properties are unsupported"),
-        }
-    }
-}
-
-fn validate_ident(name: &str) -> Result<()> {
-    let valid = !name.is_empty()
-        && name.len() <= 255
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    if valid {
-        Ok(())
-    } else {
-        Err(FsError::InvalidInput.into())
-    }
-}
-
-fn parse_markdown(text: &str) -> Result<(JsonMap<String, JsonValue>, String)> {
-    let Some(rest) = text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))
-    else {
-        return Ok((JsonMap::new(), text.to_string()));
-    };
-    let Some((yaml, body)) = split_frontmatter(rest) else {
-        return Ok((JsonMap::new(), text.to_string()));
-    };
-    let yaml_value = if yaml.trim().is_empty() {
-        JsonValue::Object(JsonMap::new())
-    } else {
-        serde_json::to_value(serde_yaml::from_str::<serde_yaml::Value>(yaml)?)?
-    };
-    let JsonValue::Object(map) = yaml_value else {
-        return Err(FsError::InvalidInput.into());
-    };
-    Ok((map, body.to_string()))
-}
-
-fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
-    for delimiter in ["\n---\n", "\n---\r\n"] {
-        if let Some(index) = rest.find(delimiter) {
-            return Some((&rest[..index], &rest[index + delimiter.len()..]));
-        }
-    }
-    None
 }
 
 fn read_slice(data: &[u8], offset: u64, size: usize) -> Result<Vec<u8>> {
@@ -1378,134 +1043,6 @@ fn read_slice(data: &[u8], offset: u64, size: usize) -> Result<Vec<u8>> {
     }
     let end = start.saturating_add(size).min(data.len());
     Ok(data[start..end].to_vec())
-}
-
-fn invalid_entry(attempted: JsonValue, error: &str) -> JsonValue {
-    json!({ "attempted": attempted, "error": error })
-}
-
-fn is_semantic_sql_error(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::Sql(rusqlite::Error::SqliteFailure(code, _))
-            if code.code == rusqlite::ErrorCode::ConstraintViolation
-                || code.code == rusqlite::ErrorCode::TypeMismatch
-    )
-}
-
-fn is_json_integer(value: &JsonValue) -> bool {
-    value
-        .as_i64()
-        .map(|_| true)
-        .or_else(|| value.as_u64().map(|n| i64::try_from(n).is_ok()))
-        .unwrap_or(false)
-}
-
-fn json_to_sql(value: &JsonValue) -> SqlValue {
-    match value {
-        JsonValue::Null => SqlValue::Null,
-        JsonValue::Bool(value) => SqlValue::Integer(i64::from(*value)),
-        JsonValue::Number(value) => value
-            .as_i64()
-            .map(SqlValue::Integer)
-            .or_else(|| {
-                value
-                    .as_u64()
-                    .and_then(|n| i64::try_from(n).ok())
-                    .map(SqlValue::Integer)
-            })
-            .or_else(|| value.as_f64().map(SqlValue::Real))
-            .unwrap_or(SqlValue::Null),
-        JsonValue::String(value) => SqlValue::Text(value.clone()),
-        JsonValue::Array(_) | JsonValue::Object(_) => SqlValue::Text(value.to_string()),
-    }
-}
-
-fn sql_to_json(value: &SqlValue) -> JsonValue {
-    match value {
-        SqlValue::Null => JsonValue::Null,
-        SqlValue::Integer(value) => JsonValue::from(*value),
-        SqlValue::Real(value) => JsonValue::from(*value),
-        SqlValue::Text(value) => JsonValue::from(value.clone()),
-        SqlValue::Blob(value) => JsonValue::from(String::from_utf8_lossy(value).to_string()),
-    }
-}
-
-fn generic_default(column: &Column) -> SqlValue {
-    match column.affinity() {
-        ColumnAffinity::Integer => SqlValue::Integer(0),
-        ColumnAffinity::Real | ColumnAffinity::Numeric => SqlValue::Real(0.0),
-        ColumnAffinity::Blob => SqlValue::Blob(Vec::new()),
-        ColumnAffinity::Text => SqlValue::Text(format!("untitled-{}", short_suffix())),
-    }
-}
-
-fn short_suffix() -> String {
-    let count = PLACEHOLDER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}-{:x}-{count:x}", std::process::id(), nanos)
-}
-
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn to_fs_error(err: Error) -> FsError {
-    match err {
-        Error::Fs(err) => err,
-        Error::Yaml(_) | Error::Utf8(_) => FsError::InvalidInput,
-        Error::Sql(_) | Error::Json(_) => FsError::Io,
-        Error::Io(err) => io_to_fs_error(err),
-    }
-}
-
-fn io_to_fs_error(err: std::io::Error) -> FsError {
-    match err.kind() {
-        std::io::ErrorKind::NotFound => FsError::NotFound,
-        std::io::ErrorKind::AlreadyExists => FsError::Exists,
-        std::io::ErrorKind::PermissionDenied => FsError::PermissionDenied,
-        std::io::ErrorKind::InvalidInput => FsError::InvalidInput,
-        _ => FsError::Io,
-    }
-}
-
-impl From<FsError> for Error {
-    fn from(value: FsError) -> Self {
-        Error::Fs(value)
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(value: rusqlite::Error) -> Self {
-        Error::Sql(value)
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(value: serde_json::Error) -> Self {
-        Error::Json(value)
-    }
-}
-
-impl From<serde_yaml::Error> for Error {
-    fn from(value: serde_yaml::Error) -> Self {
-        Error::Yaml(value)
-    }
-}
-
-impl From<std::str::Utf8Error> for Error {
-    fn from(value: std::str::Utf8Error) -> Self {
-        Error::Utf8(value)
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(value: std::io::Error) -> Self {
-        Error::Io(value)
-    }
 }
 
 #[cfg(test)]
